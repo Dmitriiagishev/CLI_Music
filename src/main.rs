@@ -7,13 +7,16 @@ mod spectrum;
 use backend::Track;
 use backend::{Action, Auth, Event, SearchEntry, State};
 use crossterm::{
-    event::{self, Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event as TermEvent, KeyCode, KeyEvent,
+        KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
@@ -43,6 +46,9 @@ struct App {
     focus: Focus,
     results: Vec<SearchEntry>,
     result_limit: usize,
+    query: String,
+    has_more: bool,
+    loading_more: bool,
     selected: usize,
     queue_selected: usize,
     button: usize,
@@ -74,7 +80,10 @@ impl App {
             input: String::new(),
             focus: Focus::Search,
             results: vec![],
-            result_limit: 10,
+            result_limit: 50,
+            query: String::new(),
+            has_more: false,
+            loading_more: false,
             selected: 0,
             queue_selected: 0,
             button: 0,
@@ -110,10 +119,26 @@ impl App {
         self.search_query(query);
     }
     fn search_query(&mut self, query: String) {
+        self.query = query;
+        self.result_limit = 50;
+        self.has_more = false;
+        self.lookup(false);
+    }
+    fn lookup(&mut self, more: bool) {
+        if more {
+            self.result_limit = self.result_limit.saturating_add(50);
+        }
+        let query = self.query.clone();
         self.search_id = self.search_id.wrapping_add(1);
         let id = self.search_id;
         self.searching = true;
-        self.message = "Ищем…".into();
+        self.loading_more = more;
+        self.message = if more {
+            "Загружаем ещё…"
+        } else {
+            "Ищем…"
+        }
+        .into();
         let auth = self.auth.clone();
         let events = self.events.clone();
         let limit = self.result_limit;
@@ -171,8 +196,25 @@ impl App {
                 self.searching = false;
                 match result {
                     Ok((tracks, warning)) => {
+                        let selected_entry = self
+                            .loading_more
+                            .then(|| self.results.get(self.selected).cloned())
+                            .flatten();
+                        let count = if self.query.starts_with("http://")
+                            || self.query.starts_with("https://")
+                        {
+                            tracks.len()
+                        } else {
+                            tracks
+                                .iter()
+                                .filter(|entry| matches!(entry, SearchEntry::Track(_)))
+                                .count()
+                        };
+                        self.has_more = count >= self.result_limit;
                         self.results = tracks;
-                        self.selected = 0;
+                        self.selected = selected_entry
+                            .and_then(|entry| self.results.iter().position(|item| *item == entry))
+                            .unwrap_or(0);
                         self.message = if !warning.is_empty() {
                             warning
                         } else if self.results.is_empty() {
@@ -180,15 +222,19 @@ impl App {
                         } else {
                             format!("Найдено: {}", self.results.len())
                         };
-                        if !self.results.is_empty() {
+                        if !self.results.is_empty() && !self.loading_more {
                             self.focus = Focus::Results;
                         }
                     }
                     Err(error) => {
-                        self.results.clear();
+                        if !self.loading_more {
+                            self.results.clear();
+                        }
+                        self.has_more = false;
                         self.message = error;
                     }
                 }
+                self.loading_more = false;
             }
             Event::Search(_, _) => {}
             Event::Cover(id, result) if id == self.cover_id => match result {
@@ -221,6 +267,170 @@ impl App {
             0 => self.send(Action::Previous),
             1 => self.send(Action::Toggle),
             _ => self.send(Action::Next),
+        }
+    }
+    fn mouse(&mut self, mouse: MouseEvent, area: Rect) {
+        if area.width < 45 || area.height < 18 {
+            return;
+        }
+        let contains = |r: Rect| {
+            mouse.column >= r.x
+                && mouse.column < r.right()
+                && mouse.row >= r.y
+                && mouse.row < r.bottom()
+        };
+        let scroll = match mouse.kind {
+            MouseEventKind::ScrollUp => -1,
+            MouseEventKind::ScrollDown => 1,
+            _ => 0,
+        };
+        if self.details_open {
+            if scroll < 0 {
+                self.details_scroll = self.details_scroll.saturating_sub(3);
+            }
+            if scroll > 0 {
+                self.details_scroll = self.details_scroll.saturating_add(3);
+            }
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                && !contains(centered(area, 75, 50))
+            {
+                self.details_open = false;
+            }
+            return;
+        }
+        if self.lyrics_open {
+            if scroll < 0 {
+                self.lyrics_scroll = self.lyrics_scroll.saturating_sub(3);
+            }
+            if scroll > 0 {
+                self.lyrics_scroll = self.lyrics_scroll.saturating_add(3);
+            }
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                && !contains(centered(area, 75, 80))
+            {
+                self.lyrics_open = false;
+            }
+            return;
+        }
+        if self.auth_open {
+            let popup = centered(area, 70, 70);
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                && contains(popup)
+                && mouse.row > popup.y
+            {
+                let index = usize::from(mouse.row - popup.y - 1);
+                if index < 5 {
+                    self.auth_selection = index;
+                    self.choose_browser();
+                }
+            } else if mouse.kind == MouseEventKind::Down(MouseButton::Left) && !contains(popup) {
+                self.auth_open = false;
+            }
+            return;
+        }
+        if self.queue_open {
+            let popup = centered(area, 75, 70);
+            let inner = panel("", false).inner(popup);
+            if scroll != 0 && contains(inner) {
+                self.queue_selected = if scroll < 0 {
+                    self.queue_selected.saturating_sub(1)
+                } else {
+                    (self.queue_selected + 1).min(self.state.queue.len().saturating_sub(1))
+                };
+            } else if mouse.kind == MouseEventKind::Down(MouseButton::Left) && contains(inner) {
+                let offset = list_offset(self.queue_selected, inner.height);
+                let index = offset + usize::from(mouse.row - inner.y);
+                if index < self.state.queue.len() {
+                    self.queue_selected = index;
+                }
+            } else if mouse.kind == MouseEventKind::Down(MouseButton::Left) && !contains(popup) {
+                self.toggle_queue();
+            }
+            return;
+        }
+        let (left, right) = main_layout(area);
+        let results = panel("", false).inner(left[1]);
+        if scroll != 0 && contains(results) {
+            self.focus = Focus::Results;
+            self.selected = if scroll < 0 {
+                self.selected.saturating_sub(3)
+            } else {
+                self.selected
+                    .saturating_add(3)
+                    .min(self.results.len().saturating_sub(1))
+            };
+            return;
+        }
+        if scroll != 0 && contains(right[0]) {
+            self.lyrics_scroll = if scroll < 0 {
+                self.lyrics_scroll.saturating_sub(3)
+            } else {
+                self.lyrics_scroll.saturating_add(3)
+            };
+            return;
+        }
+        if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+            return;
+        }
+        if contains(left[0]) {
+            self.focus = Focus::Search;
+        } else if contains(results) {
+            let artists = self
+                .results
+                .iter()
+                .filter(|e| matches!(e, SearchEntry::Artist { .. }))
+                .count();
+            let selected_row = result_row(self.selected, artists, self.results.len());
+            let row =
+                list_offset(selected_row, results.height) + usize::from(mouse.row - results.y);
+            if let Some(index) =
+                (0..self.results.len()).find(|&i| result_row(i, artists, self.results.len()) == row)
+            {
+                self.selected = index;
+                self.focus = Focus::Results;
+                self.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            }
+        } else {
+            let player = panel("", false).inner(left[2]);
+            if mouse.row == left[2].y && contains(left[2]) {
+                let x = usize::from(mouse.column.saturating_sub(left[2].x + 1));
+                let options = [
+                    " Плеер · ",
+                    "Очередь",
+                    " · ",
+                    "G вход",
+                    " · ",
+                    "L текст",
+                    " · ",
+                    "E сообщение",
+                ];
+                let mut start = 0;
+                for (index, label) in options.iter().enumerate() {
+                    let end = start + UnicodeWidthStr::width(*label);
+                    if x >= start && x < end {
+                        match index {
+                            1 => self.toggle_queue(),
+                            3 => self.auth_open = true,
+                            5 => self.lyrics_open = true,
+                            7 => {
+                                self.details_scroll = 0;
+                                self.details_open = true;
+                            }
+                            _ => {}
+                        }
+                        break;
+                    }
+                    start = end;
+                }
+            } else if contains(player) {
+                self.focus = Focus::Controls;
+                if mouse.row == player.y + 2 && player.width > 0 {
+                    self.button = (usize::from(mouse.column - player.x) * 3
+                        / usize::from(player.width))
+                    .min(2);
+                    self.activate_button();
+                }
+            }
         }
     }
     fn choose_browser(&mut self) {
@@ -268,6 +478,15 @@ impl App {
                 KeyCode::Down => self.lyrics_scroll = self.lyrics_scroll.saturating_add(1),
                 _ => {}
             }
+            return true;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Up | KeyCode::Down)
+        {
+            if self.queue_open {
+                self.toggle_queue();
+            }
+            self.focus = Focus::Controls;
             return true;
         }
         if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
@@ -366,7 +585,9 @@ impl App {
             },
             KeyCode::Down => match self.focus {
                 Focus::Results if self.selected + 1 >= self.results.len() => {
-                    self.focus = Focus::Controls
+                    if !self.has_more {
+                        self.focus = Focus::Controls
+                    }
                 }
                 Focus::Results => self.selected += 1,
                 _ => {}
@@ -403,15 +624,13 @@ fn panel(title: &str, selected: bool) -> Block<'_> {
             Color::DarkGray
         }))
 }
-fn draw(frame: &mut Frame, app: &App) {
-    let area = frame.area();
-    if area.width < 45 || area.height < 18 {
-        frame.render_widget(
-            Paragraph::new("Увеличьте окно терминала (минимум 45 × 18)"),
-            area,
-        );
-        return;
-    }
+fn list_offset(selected: usize, height: u16) -> usize {
+    selected.saturating_sub(usize::from(height.saturating_sub(1)))
+}
+fn result_row(index: usize, artists: usize, total: usize) -> usize {
+    index + usize::from(artists > 0) + usize::from(total > artists && index >= artists)
+}
+fn main_layout(area: Rect) -> (std::rc::Rc<[Rect]>, std::rc::Rc<[Rect]>) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
@@ -424,6 +643,22 @@ fn draw(frame: &mut Frame, app: &App) {
             Constraint::Length(8),
         ])
         .split(columns[0]);
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(4), Constraint::Length(14)])
+        .split(columns[1]);
+    (left, right)
+}
+fn draw(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    if area.width < 45 || area.height < 18 {
+        frame.render_widget(
+            Paragraph::new("Увеличьте окно терминала (минимум 45 × 18)"),
+            area,
+        );
+        return;
+    }
+    let (left, right) = main_layout(area);
     let search = if app.input.is_empty() {
         "Введите название, исполнителя или ссылку…"
     } else {
@@ -497,9 +732,9 @@ fn draw(frame: &mut Frame, app: &App) {
     }
     let mut rs = ListState::default();
     if !app.results.is_empty() {
-        let header_count =
-            usize::from(artists > 0) + usize::from(tracks > 0 && app.selected >= artists);
-        rs.select(Some(app.selected + header_count));
+        let row = result_row(app.selected, artists, app.results.len());
+        rs.select(Some(row));
+        *rs.offset_mut() = list_offset(row, left[1].height.saturating_sub(2));
     }
     frame.render_stateful_widget(
         List::new(results)
@@ -512,10 +747,6 @@ fn draw(frame: &mut Frame, app: &App) {
         left[1],
         &mut rs,
     );
-    let right = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(4), Constraint::Length(8)])
-        .split(columns[1]);
     draw_cover(frame, right[0], app);
     let status = if app.state.loading {
         "Загрузка"
@@ -533,7 +764,7 @@ fn draw(frame: &mut Frame, app: &App) {
         .map(|t| t.title.as_str())
         .unwrap_or("Выберите трек");
     let player_block = panel(
-        " Плеер · G вход · L текст · E сообщение ",
+        " Плеер · Очередь · G вход · L текст · E сообщение ",
         app.focus == Focus::Controls,
     );
     let inside = player_block.inner(left[2]);
@@ -599,6 +830,8 @@ fn draw(frame: &mut Frame, app: &App) {
         let mut selection = ListState::default();
         if !queue.is_empty() {
             selection.select(Some(app.queue_selected));
+            *selection.offset_mut() =
+                list_offset(app.queue_selected, popup.height.saturating_sub(2));
         }
         frame.render_stateful_widget(
             List::new(queue)
@@ -754,38 +987,30 @@ fn draw_spectrum(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     if inner.width < spectrum::BANDS as u16 || inner.height == 0 {
         return;
     }
-    let labels = inner.height >= 3 && inner.width >= 32;
-    let height = inner.height.saturating_sub(u16::from(labels));
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Ratio(1, 16); spectrum::BANDS])
-        .split(inner);
-    let frequency = [
-        "63", "", "125", "", "250", "", "500", "", "1k", "", "2k", "", "4k", "", "8k", "",
-    ];
-    for (index, column) in columns.iter().enumerate() {
-        let lit = (app.levels[index] * f32::from(height)).round() as u16;
+    let bands = spectrum::BANDS as u16;
+    let gap = u16::from(inner.width >= bands * 2 - 1);
+    let bar_width = (inner.width - gap * (bands - 1)) / bands;
+    let used = bar_width * bands + gap * (bands - 1);
+    let start = inner.x + (inner.width - used) / 2;
+    let height = inner.height.min(12);
+    for index in 0..spectrum::BANDS {
+        let lit = (app.levels[index] * 12.0).round() as u16;
         for row in 0..height {
-            let bottom = height - row;
+            let bottom = ((height - row) * 12 + height - 1) / height;
             if bottom > lit {
                 continue;
             }
-            let fraction = f32::from(bottom) / f32::from(height);
+            let fraction = f32::from(bottom) / 12.0;
             let color = spectrum_color(fraction);
-            let segment = "─".repeat(usize::from(column.width.saturating_sub(1).max(1)));
+            let segment = "─".repeat(usize::from(bar_width));
             frame.render_widget(
-                Paragraph::new(segment)
-                    .alignment(ratatui::layout::Alignment::Center)
-                    .style(Style::default().fg(color)),
-                ratatui::layout::Rect::new(column.x, inner.y + row, column.width, 1),
-            );
-        }
-        if labels {
-            frame.render_widget(
-                Paragraph::new(frequency[index])
-                    .alignment(ratatui::layout::Alignment::Center)
-                    .style(Style::default().fg(Color::Gray)),
-                ratatui::layout::Rect::new(column.x, inner.y + height, column.width, 1),
+                Paragraph::new(segment).style(Style::default().fg(color)),
+                ratatui::layout::Rect::new(
+                    start + index as u16 * (bar_width + gap),
+                    inner.y + inner.height - height + row,
+                    bar_width,
+                    1,
+                ),
             );
         }
     }
@@ -794,7 +1019,7 @@ fn draw_spectrum(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
 fn spectrum_color(fraction: f32) -> Color {
     if fraction <= 0.5 {
         Color::Reset
-    } else if fraction <= 0.8 {
+    } else if fraction <= 10.0 / 12.0 {
         Color::Rgb(216, 139, 72)
     } else {
         Color::Rgb(121, 44, 67)
@@ -805,7 +1030,7 @@ struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
     }
 }
 fn run(auth: Auth) -> io::Result<()> {
@@ -816,7 +1041,7 @@ fn run(auth: Auth) -> io::Result<()> {
     }
     enable_raw_mode()?;
     let _guard = TerminalGuard;
-    execute!(io::stdout(), EnterAlternateScreen)?;
+    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let (actions, action_rx) = mpsc::channel();
     let (events, event_rx) = mpsc::channel();
@@ -829,14 +1054,26 @@ fn run(auth: Auth) -> io::Result<()> {
             while let Ok(event) = event_rx.try_recv() {
                 app.handle_event(event);
             }
-            app.result_limit =
-                usize::from(terminal.size()?.height.saturating_sub(15)).clamp(1, 100);
+            if app.focus == Focus::Results
+                && app.has_more
+                && !app.searching
+                && app.selected.saturating_add(10) >= app.results.len()
+            {
+                app.lookup(true);
+            }
             terminal.draw(|frame| draw(frame, &app))?;
             if event::poll(Duration::from_millis(100))? {
-                if let TermEvent::Key(key) = event::read()? {
-                    if key.kind != KeyEventKind::Release && !app.key(key) {
-                        break;
+                match event::read()? {
+                    TermEvent::Key(key) => {
+                        if key.kind != KeyEventKind::Release && !app.key(key) {
+                            break;
+                        }
                     }
+                    TermEvent::Mouse(mouse) => {
+                        let size = terminal.size()?;
+                        app.mouse(mouse, Rect::new(0, 0, size.width, size.height));
+                    }
+                    _ => {}
                 }
             }
         }
@@ -994,10 +1231,114 @@ mod tests {
 
     #[test]
     fn spectrum_uses_theme_color_then_orange_and_burgundy() {
-        assert_eq!(spectrum::BANDS, 16);
+        assert_eq!(spectrum::BANDS, 12);
         assert_eq!(spectrum_color(0.5), Color::Reset);
         assert_eq!(spectrum_color(0.65), Color::Rgb(216, 139, 72));
         assert_eq!(spectrum_color(0.9), Color::Rgb(121, 44, 67));
+    }
+    #[test]
+    fn spectrum_has_equal_bars_and_twelve_segments() {
+        let (mut app, _) = make_app();
+        app.levels = [1.0; spectrum::BANDS];
+        let backend = ratatui::backend::TestBackend::new(55, 14);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_spectrum(frame, frame.area(), &app))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        for y in 1..13 {
+            let row: String = (1..54)
+                .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                .collect();
+            let bars: Vec<_> = row.split_whitespace().collect();
+            assert_eq!(bars.len(), 12);
+            assert!(bars
+                .iter()
+                .all(|bar| bar.chars().count() == bars[0].chars().count()));
+        }
+    }
+    #[test]
+    fn ctrl_arrows_reach_controls_and_mouse_activates_pause() {
+        let (mut app, rx) = make_app();
+        app.key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
+        assert!(app.focus == Focus::Controls);
+        app.focus = Focus::Search;
+        app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+        assert!(app.focus == Focus::Controls);
+        let area = Rect::new(0, 0, 120, 40);
+        let (left, _) = main_layout(area);
+        let player = panel("", false).inner(left[2]);
+        app.mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: player.x + player.width / 2,
+                row: player.y + 2,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        );
+        assert!(matches!(rx.try_recv(), Ok(Action::Toggle)));
+    }
+    #[test]
+    fn mouse_selects_visible_result_in_scrolled_list() {
+        let (mut app, rx) = make_app();
+        app.results = (0..60)
+            .map(|i| {
+                SearchEntry::Track(Track {
+                    title: format!("song {i}"),
+                    url: format!("track{i}"),
+                })
+            })
+            .collect();
+        app.selected = 40;
+        let area = Rect::new(0, 0, 120, 30);
+        let (left, _) = main_layout(area);
+        let inner = panel("", false).inner(left[1]);
+        let row = result_row(app.selected, 0, app.results.len());
+        let offset = list_offset(row, inner.height);
+        let clicked = offset + 2;
+        let index = clicked - 1;
+        app.mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: inner.x,
+                row: inner.y + 2,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(Action::Play(track)) if track.url == format!("track{index}"))
+        );
+    }
+    #[test]
+    fn loading_more_preserves_selection_and_focus() {
+        let (mut app, _) = make_app();
+        app.query = "test".into();
+        app.search_id = 5;
+        app.loading_more = true;
+        app.focus = Focus::Controls;
+        let track = SearchEntry::Track(Track {
+            title: "one".into(),
+            url: "one".into(),
+        });
+        app.results = vec![track.clone()];
+        app.handle_event(Event::Search(
+            5,
+            Ok((
+                vec![
+                    track.clone(),
+                    SearchEntry::Track(Track {
+                        title: "two".into(),
+                        url: "two".into(),
+                    }),
+                ],
+                String::new(),
+            )),
+        ));
+        assert!(app.focus == Focus::Controls);
+        assert_eq!(app.results[app.selected], track);
+        assert!(!app.has_more);
     }
     #[test]
     fn browser_picker_moves_selection() {

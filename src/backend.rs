@@ -105,7 +105,7 @@ pub fn lookup(
     }
     let mut cmd = Command::new("yt-dlp");
     auth.apply(&mut cmd);
-    let limit = limit.clamp(1, 100);
+    let limit = limit.max(1);
     let target = if query.starts_with("https://") || query.starts_with("http://") {
         query.to_owned()
     } else {
@@ -551,6 +551,8 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
                     {
                         let previous = if let Some(previous) = &active.initial_error {
                             format!("{previous}\nПовтор через yt-dlp:\n{logs}")
+                        } else if active.mode == AudioMode::TvPipe {
+                            logs.clone()
                         } else {
                             logs.lines()
                                 .find(|line| is_forbidden(line))
@@ -657,7 +659,11 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
                     state.volume,
                     events.clone(),
                     true,
-                    AudioMode::Default,
+                    if authenticated_music(&track.url, &auth) {
+                        AudioMode::TvPipe
+                    } else {
+                        AudioMode::Default
+                    },
                     None,
                 ) {
                     Ok(active) => player = Some(active),

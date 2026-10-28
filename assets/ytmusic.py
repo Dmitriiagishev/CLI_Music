@@ -29,16 +29,22 @@ def main():
     # ("Songs", "Artists"). Russian shelf labels are silently discarded.
     api = YTMusic(requests_session=TimedSession(), language="en")
     if mode == "search":
-        limit = max(1, min(int(sys.argv[3]), 100))
-        artists = api.search(value, filter="artists", limit=min(5, max(1, limit // 4)))
+        limit = max(1, int(sys.argv[3]))
+        artists = api.search(value, filter="artists", limit=20)
         songs = api.search(value, filter="songs", limit=limit)
         result = [{"type": "artist", "title": a.get("artist") or a.get("name") or "Исполнитель",
                    "url": "musicartist:" + a["browseId"]} for a in artists if a.get("browseId")]
-        result.extend([x for x in (song(s) for s in songs) if x][:max(0, limit - len(result))])
+        result.extend([x for x in (song(s) for s in songs) if x][:limit])
         return result
     if mode == "artist":
-        limit = max(1, min(int(sys.argv[3]), 100))
-        items = (api.get_artist(value).get("songs") or {}).get("results") or []
+        limit = max(1, int(sys.argv[3]))
+        songs = api.get_artist(value).get("songs") or {}
+        browse_id = songs.get("browseId")
+        if browse_id:
+            playlist_id = browse_id.removeprefix("VL")
+            items = api.get_playlist(playlist_id, limit=limit).get("tracks") or []
+        else:
+            items = songs.get("results") or []
         return [x for x in (song(s) for s in items[:limit]) if x]
     if mode == "lyrics":
         playlist = api.get_watch_playlist(videoId=value, limit=1)

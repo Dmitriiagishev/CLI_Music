@@ -18,10 +18,17 @@ class FakeMusic:
     def search(self, query, filter, limit):
         if filter == "artists":
             return [{"artist": "Artist", "browseId": "UC123"}]
+        if query == "many":
+            return [{"title": f"Song {i}", "videoId": f"id{i}"} for i in range(min(limit, 150))]
         return [{"title": "Song", "videoId": "abc", "artists": [{"name": "Artist"}]}]
 
     def get_artist(self, value):
-        return {"songs": {"results": [{"title": "Song", "videoId": "abc", "artists": [{"name": "Artist"}]}]}}
+        return {"songs": {"browseId": "VLPL123", "results": [{"title": "Preview", "videoId": "old"}]}}
+
+    def get_playlist(self, value, limit):
+        if value != "PL123":
+            raise AssertionError("Artist playlist ID must omit VL prefix")
+        return {"tracks": [{"title": "Song" if i == 0 else f"Song {i}", "videoId": "abc" if i == 0 else f"id{i}", "artists": [{"name": "Artist"}]} for i in range(min(limit, 150))]}
 
     def get_watch_playlist(self, **kwargs):
         return {"lyrics": "LYRICS_ID"}
@@ -42,6 +49,9 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual([entry["type"] for entry in result], ["artist", "track"])
         self.assertEqual(result[0]["url"], "musicartist:UC123")
         self.assertEqual(result[1]["url"], "https://music.youtube.com/watch?v=abc")
+        many = self.call("search", "many", "120")
+        self.assertEqual(len(many), 121)
+        self.assertEqual(many[-1]["title"], "Song 119")
 
     def test_library_drops_russian_filtered_shelves(self):
         from ytmusicapi import YTMusic
@@ -61,6 +71,9 @@ class AdapterTests(unittest.TestCase):
 
     def test_artist_tracks_and_lyrics(self):
         self.assertEqual(self.call("artist", "UC123")[0]["title"], "Artist — Song")
+        tracks = self.call("artist", "UC123", "120")
+        self.assertEqual(len(tracks), 120)
+        self.assertEqual(tracks[-1]["title"], "Artist — Song 119")
         self.assertEqual(self.call("lyrics", "abc"), "First line\nSecond line")
 
 
