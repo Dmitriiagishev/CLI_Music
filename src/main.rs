@@ -1,7 +1,8 @@
 use std::collections::VecDeque;
 use std::env;
 use std::io::{self, BufRead, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
@@ -61,7 +62,6 @@ fn lookup(query: &str, auth: &Auth) -> Result<Vec<Track>, String> {
         .args([
             "--ignore-config",
             "--flat-playlist",
-            "--no-warnings",
             "--print",
             "%(id)s\t%(title)s",
             "--",
@@ -74,6 +74,10 @@ fn lookup(query: &str, auth: &Auth) -> Result<Vec<Track>, String> {
             "Ошибка yt-dlp: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ));
+    }
+    let warnings = String::from_utf8_lossy(&output.stderr);
+    if !warnings.trim().is_empty() {
+        eprintln!("{}", warnings.trim());
     }
     Ok(parse_tracks(&String::from_utf8_lossy(&output.stdout)))
 }
@@ -120,26 +124,96 @@ fn resolve(track: &Track, auth: &Auth) -> Result<String, String> {
     }
 }
 
-fn send_input(stdin: &mut ChildStdin, command: &str) {
-    let _ = writeln!(stdin, "{command}");
-    let _ = stdin.flush();
+static NEXT_PLAYER: AtomicU64 = AtomicU64::new(0);
+
+struct Player {
+    child: Child,
+    endpoint: String,
+    #[cfg(unix)]
+    directory: std::path::PathBuf,
 }
-fn stop_player(player: &mut Option<(Child, ChildStdin)>) {
-    if let Some((mut child, mut input)) = player.take() {
-        send_input(&mut input, "quit");
-        // A stalled player must not hold up exit or skipping.
-        let _ = child.kill();
-        let _ = child.wait();
+
+impl Player {
+    fn start(url: &str, volume: i32) -> io::Result<Self> {
+        let id = NEXT_PLAYER.fetch_add(1, Ordering::Relaxed);
+        let name = format!("cli-music-{}-{id}", std::process::id());
+        #[cfg(unix)]
+        let (endpoint, directory) = {
+            use std::os::unix::fs::DirBuilderExt;
+            let dir = env::temp_dir().join(&name);
+            std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+            (dir.join("mpv.sock").to_string_lossy().into_owned(), dir)
+        };
+        #[cfg(windows)]
+        let endpoint = format!(r"\\.\pipe\{name}");
+        let child = Command::new("mpv")
+            .args([
+                "--no-video",
+                "--input-terminal=no",
+                "--msg-level=all=warn",
+                &format!("--input-ipc-server={endpoint}"),
+                &format!("--volume={volume}"),
+                "--",
+                url,
+            ])
+            .stdin(Stdio::null())
+            .spawn();
+        match child {
+            Ok(child) => Ok(Self {
+                child,
+                endpoint,
+                #[cfg(unix)]
+                directory,
+            }),
+            Err(e) => {
+                #[cfg(unix)]
+                let _ = std::fs::remove_dir(&directory);
+                Err(e)
+            }
+        }
     }
+
+    fn command(&self, command: &str) {
+        // mpv creates the endpoint asynchronously after startup.
+        for _ in 0..20 {
+            #[cfg(unix)]
+            let connection = std::os::unix::net::UnixStream::connect(&self.endpoint);
+            #[cfg(windows)]
+            let connection = std::fs::OpenOptions::new().write(true).open(&self.endpoint);
+            if let Ok(mut connection) = connection {
+                if let Err(e) = writeln!(connection, "{command}") {
+                    eprintln!("Не удалось отправить команду mpv: {e}");
+                }
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        eprintln!("Не удалось подключиться к управлению mpv.");
+    }
+}
+impl Drop for Player {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        #[cfg(unix)]
+        {
+            let _ = std::fs::remove_file(&self.endpoint);
+            let _ = std::fs::remove_dir(&self.directory);
+        }
+    }
+}
+fn stop_player(player: &mut Option<Player>) {
+    // Dropping the player terminates it and removes its private IPC directory.
+    *player = None;
 }
 fn player_loop(rx: Receiver<Action>, auth: Auth) {
     let mut queue = VecDeque::<Track>::new();
-    let mut player: Option<(Child, ChildStdin)> = None;
+    let mut player: Option<Player> = None;
     let mut current: Option<Track> = None;
     let mut volume = 100i32;
     loop {
-        if let Some((child, _)) = player.as_mut() {
-            match child.try_wait() {
+        if let Some(active) = player.as_mut() {
+            match active.child.try_wait() {
                 Ok(Some(status)) => {
                     if !status.success() {
                         eprintln!("\nmpv завершился с ошибкой: {status}");
@@ -159,29 +233,13 @@ fn player_loop(rx: Receiver<Action>, auth: Auth) {
             if let Some(track) = queue.pop_front() {
                 println!("\n▶ {}", track.title);
                 match resolve(&track, &auth) {
-                    Ok(url) => {
-                        let result = Command::new("mpv")
-                            .args([
-                                "--no-video",
-                                "--no-terminal",
-                                "--input-file=-",
-                                &format!("--volume={volume}"),
-                                "--",
-                                &url,
-                            ])
-                            .stdin(Stdio::piped())
-                            .stdout(Stdio::null())
-                            .spawn();
-                        match result {
-                            Ok(mut child) => {
-                                if let Some(input) = child.stdin.take() {
-                                    player = Some((child, input));
-                                    current = Some(track);
-                                }
-                            }
-                            Err(e) => eprintln!("Не удалось запустить mpv: {e}"),
+                    Ok(url) => match Player::start(&url, volume) {
+                        Ok(active) => {
+                            player = Some(active);
+                            current = Some(track);
                         }
-                    }
+                        Err(e) => eprintln!("Не удалось запустить mpv: {e}"),
+                    },
                     Err(e) => eprintln!("Не удалось получить поток: {e}"),
                 }
                 continue;
@@ -193,8 +251,8 @@ fn player_loop(rx: Receiver<Action>, auth: Auth) {
                 queue.extend(tracks);
             }
             Ok(Action::Toggle) => {
-                if let Some((_, input)) = player.as_mut() {
-                    send_input(input, "cycle pause");
+                if let Some(active) = player.as_mut() {
+                    active.command("cycle pause");
                 } else {
                     println!("Сейчас ничего не играет.");
                 }
@@ -211,8 +269,8 @@ fn player_loop(rx: Receiver<Action>, auth: Auth) {
             }
             Ok(Action::Volume(delta)) => {
                 volume = (volume + delta).clamp(0, 100);
-                if let Some((_, input)) = player.as_mut() {
-                    send_input(input, &format!("set volume {volume}"));
+                if let Some(active) = player.as_mut() {
+                    active.command(&format!("set volume {volume}"));
                 }
                 println!("Громкость: {volume}%");
             }
@@ -298,7 +356,10 @@ fn main() {
                 }
                 println!("Загрузка…");
                 match lookup(argument, &auth) {
-                    Ok(tracks) if tracks.is_empty() => println!("Ничего не найдено."),
+                    Ok(tracks) if tracks.is_empty() => {
+                        results.clear();
+                        println!("Ничего не найдено. Проверьте запрос или сообщения yt-dlp выше.");
+                    }
                     Ok(tracks) if command == "url" => send(&tx, Action::Add(tracks)),
                     Ok(tracks) => {
                         results = tracks;
