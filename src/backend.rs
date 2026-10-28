@@ -139,14 +139,22 @@ pub fn lookup(
 
 static NEXT_PLAYER: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AudioMode {
+    Default,
+    Pipe,
+}
 struct Player {
     child: Child,
+    downloader: Option<Child>,
     endpoint: String,
     #[cfg(unix)]
     directory: std::path::PathBuf,
     spectrum: Option<crate::spectrum::Spectrum>,
     track_url: String,
     auth: Auth,
+    mode: AudioMode,
+    initial_error: Option<String>,
     logs: Arc<Mutex<VecDeque<String>>>,
     readers: Vec<thread::JoinHandle<()>>,
 }
@@ -158,6 +166,8 @@ impl Player {
         volume: i32,
         events: Sender<Event>,
         enable_spectrum: bool,
+        mode: AudioMode,
+        initial_error: Option<String>,
     ) -> io::Result<Self> {
         let id = NEXT_PLAYER.fetch_add(1, Ordering::Relaxed);
         let name = format!("cli-music-{}-{id}", std::process::id());
@@ -182,19 +192,58 @@ impl Player {
                 "Анализатор частот недоступен на этой системе".into(),
             ));
         }
+        let logs = Arc::new(Mutex::new(VecDeque::new()));
+        let mut readers = Vec::new();
+        let mut downloader = None;
+        let mut media_input = Stdio::null();
         let mut command = Command::new("mpv");
-        command.args([
-            "--ytdl=yes",
-            "--script-opts=ytdl_hook-ytdl_path=yt-dlp",
-            "--ytdl-format=bestaudio/best",
-        ]);
-        if let Some(browser) = &auth.browser {
-            command.arg(format!(
-                "--ytdl-raw-options-append=cookies-from-browser={browser}"
-            ));
-        }
-        if let Some(path) = &auth.cookies {
-            command.arg(format!("--ytdl-raw-options-append=cookies={path}"));
+        if mode == AudioMode::Pipe {
+            let mut extract = Command::new("yt-dlp");
+            auth.apply(&mut extract);
+            extract.args([
+                "--no-playlist",
+                "--no-progress",
+                "-f",
+                "bestaudio/best",
+                "-o",
+                "-",
+                "--",
+                url,
+            ]);
+            let result = extract
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn();
+            let mut process = match result {
+                Ok(process) => process,
+                Err(error) => {
+                    #[cfg(unix)]
+                    let _ = std::fs::remove_dir(&directory);
+                    return Err(error);
+                }
+            };
+            if let Some(stderr) = process.stderr.take() {
+                readers.push(collect_output(stderr, logs.clone()));
+            }
+            if let Some(stdout) = process.stdout.take() {
+                media_input = Stdio::from(stdout);
+            }
+            downloader = Some(process);
+            command.arg("--ytdl=no");
+        } else {
+            command.args([
+                "--ytdl=yes",
+                "--script-opts=ytdl_hook-ytdl_path=yt-dlp",
+                "--ytdl-format=bestaudio/best",
+            ]);
+            if let Some(browser) = &auth.browser {
+                command.arg(format!(
+                    "--ytdl-raw-options-append=cookies-from-browser={browser}"
+                ));
+            }
+            if let Some(path) = &auth.cookies {
+                command.arg(format!("--ytdl-raw-options-append=cookies={path}"));
+            }
         }
         if let Some(graph) = spectrum.as_ref().and_then(|s| s.graph()) {
             command.arg(format!("--af=lavfi=[{graph}]"));
@@ -207,16 +256,14 @@ impl Player {
                 &format!("--input-ipc-server={endpoint}"),
                 &format!("--volume={volume}"),
                 "--",
-                url,
+                if mode == AudioMode::Pipe { "-" } else { url },
             ])
-            .stdin(Stdio::null())
+            .stdin(media_input)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn();
         match child {
             Ok(mut child) => {
-                let logs = Arc::new(Mutex::new(VecDeque::new()));
-                let mut readers = Vec::new();
                 if let Some(stream) = child.stdout.take() {
                     readers.push(collect_output(stream, logs.clone()));
                 }
@@ -225,17 +272,24 @@ impl Player {
                 }
                 Ok(Self {
                     child,
+                    downloader,
                     endpoint,
                     #[cfg(unix)]
                     directory,
                     spectrum,
                     track_url: url.to_owned(),
                     auth: auth.clone(),
+                    mode,
+                    initial_error,
                     logs,
                     readers,
                 })
             }
             Err(e) => {
+                if let Some(mut process) = downloader {
+                    let _ = process.kill();
+                    let _ = process.wait();
+                }
                 #[cfg(unix)]
                 let _ = std::fs::remove_dir(&directory);
                 Err(e)
@@ -243,14 +297,26 @@ impl Player {
         }
     }
 
-    fn finish_logs(&mut self) -> String {
+    fn finish_logs(&mut self) -> (String, bool) {
+        let mut download_failed = false;
+        if let Some(mut process) = self.downloader.take() {
+            match process.try_wait() {
+                Ok(Some(status)) => download_failed = !status.success(),
+                _ => {
+                    let _ = process.kill();
+                    let _ = process.wait();
+                }
+            }
+        }
         for reader in self.readers.drain(..) {
             let _ = reader.join();
         }
-        self.logs
+        let output = self
+            .logs
             .lock()
             .map(|lines| lines.iter().cloned().collect::<Vec<_>>().join("\n"))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        (output, download_failed)
     }
 
     #[cfg(unix)]
@@ -296,6 +362,10 @@ impl Drop for Player {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(mut process) = self.downloader.take() {
+            let _ = process.kill();
+            let _ = process.wait();
+        }
         #[cfg(unix)]
         {
             let _ = std::fs::remove_file(&self.endpoint);
@@ -338,6 +408,12 @@ fn collect_output(
                 lines.push_back(sanitize_log(&line));
             }
         }
+    })
+}
+fn is_forbidden(logs: &str) -> bool {
+    logs.lines().any(|line| {
+        let line = line.to_ascii_lowercase();
+        line.contains("403") && (line.contains("http") || line.contains("forbidden"))
     })
 }
 fn filter_failed(logs: &str) -> bool {
@@ -396,16 +472,22 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
         if let Some(active) = player.as_mut() {
             match active.child.try_wait() {
                 Ok(Some(status)) => {
-                    let logs = active.finish_logs();
-                    if !status.success() && active.spectrum.is_some() && filter_failed(&logs) {
-                        let url = active.track_url.clone();
-                        let player_auth = active.auth.clone();
+                    let (logs, download_failed) = active.finish_logs();
+                    let success = status.success() && !download_failed;
+                    if !success && active.spectrum.is_some() && filter_failed(&logs) {
                         let _ = events.send(Event::Spectrum([0.0; crate::spectrum::BANDS]));
                         let _ = events.send(Event::Message(
                             "Анализатор недоступен; повторяем без него".into(),
                         ));
-                        match Player::start(&url, &player_auth, state.volume, events.clone(), false)
-                        {
+                        match Player::start(
+                            &active.track_url,
+                            &active.auth,
+                            state.volume,
+                            events.clone(),
+                            false,
+                            active.mode,
+                            active.initial_error.clone(),
+                        ) {
                             Ok(replacement) => {
                                 state.loading = true;
                                 publish(&mut state, &queue);
@@ -418,15 +500,55 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
                                 )));
                             }
                         }
-                    } else if !status.success() {
-                        let message = if logs.is_empty() {
-                            format!("mpv завершился с ошибкой: {status}")
+                    } else if !success && active.mode == AudioMode::Default && is_forbidden(&logs) {
+                        let first_error = logs
+                            .lines()
+                            .find(|line| is_forbidden(line))
+                            .unwrap_or("HTTP 403 Forbidden")
+                            .to_owned();
+                        let _ = events.send(Event::Message(
+                            "Поток вернул 403; пробуем воспроизведение через yt-dlp…".into(),
+                        ));
+                        match Player::start(
+                            &active.track_url,
+                            &active.auth,
+                            state.volume,
+                            events.clone(),
+                            active.spectrum.is_some(),
+                            AudioMode::Pipe,
+                            Some(first_error),
+                        ) {
+                            Ok(replacement) => {
+                                state.loading = true;
+                                publish(&mut state, &queue);
+                                player = Some(replacement);
+                                continue;
+                            }
+                            Err(e) => {
+                                let _ = events.send(Event::Message(format!(
+                                    "Не удалось повторить воспроизведение: {e}\n{logs}"
+                                )));
+                            }
+                        }
+                    } else if !success {
+                        let previous = active
+                            .initial_error
+                            .as_ref()
+                            .map(|error| format!("Первый поток: {error}\nПовтор через yt-dlp:\n"))
+                            .unwrap_or_default();
+                        let outcome = if download_failed {
+                            "yt-dlp завершился с ошибкой".to_owned()
                         } else {
-                            format!("mpv: {status}\n{logs}")
+                            format!("mpv: {status}")
+                        };
+                        let message = if logs.is_empty() {
+                            format!("{previous}{outcome}")
+                        } else {
+                            format!("{previous}{outcome}\n{logs}")
                         };
                         let _ = events.send(Event::Message(message));
                     }
-                    if status.success() {
+                    if success {
                         if let Some(track) = state.current.take() {
                             history.push(track);
                         }
@@ -451,6 +573,7 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
         if last_spectrum.elapsed() >= Duration::from_millis(200) {
             if state.loading && player.as_ref().is_some_and(|p| p.playback_started()) {
                 state.loading = false;
+                let _ = events.send(Event::Message(String::new()));
                 publish(&mut state, &queue);
             }
             let levels = if state.paused {
@@ -471,7 +594,15 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
                 state.current = Some(track.clone());
                 state.paused = false;
                 state.loading = true;
-                match Player::start(&track.url, &auth, state.volume, events.clone(), true) {
+                match Player::start(
+                    &track.url,
+                    &auth,
+                    state.volume,
+                    events.clone(),
+                    true,
+                    AudioMode::Default,
+                    None,
+                ) {
                     Ok(active) => player = Some(active),
                     Err(e) => {
                         state.current = None;
@@ -580,6 +711,9 @@ mod tests {
         assert!(filter_failed("Failed to configure filter graph"));
         assert!(!filter_failed("Sign in to confirm you’re not a bot"));
         assert!(!filter_failed("HTTP 403 Forbidden"));
+        assert!(is_forbidden("[ffmpeg] https: HTTP error 403 Forbidden"));
+        assert!(is_forbidden("HTTP 403"));
+        assert!(!is_forbidden("Sign in to confirm you're not a bot"));
     }
 
     #[test]
