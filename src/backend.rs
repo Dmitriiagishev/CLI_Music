@@ -559,20 +559,11 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
                     } else if !success
                         && forbidden_retry(active.mode, &logs) == Some(AudioMode::HlsPipe)
                     {
-                        let error = logs
-                            .lines()
-                            .find(|line| {
-                                is_forbidden(line)
-                                    || line
-                                        .to_ascii_lowercase()
-                                        .contains("requested format is not available")
-                            })
-                            .unwrap_or("Формат недоступен");
                         let previous = active
                             .initial_error
                             .as_deref()
                             .unwrap_or("HTTP 403 Forbidden");
-                        let previous = format!("{previous}\nПовтор через yt-dlp: {error}");
+                        let previous = format!("{previous}\nПовтор через yt-dlp:\n{logs}");
                         let _ = events.send(Event::Message(
                             "Повтор не удался; пробуем аудио HLS через yt-dlp…".into(),
                         ));

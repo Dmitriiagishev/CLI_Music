@@ -63,6 +63,7 @@ struct App {
     auth_open: bool,
     auth_selection: usize,
     details_open: bool,
+    details_scroll: u16,
 }
 impl App {
     fn new(auth: Auth, actions: Sender<Action>, events: Sender<Event>) -> Self {
@@ -94,6 +95,7 @@ impl App {
             auth_open: false,
             auth_selection: 0,
             details_open: false,
+            details_scroll: 0,
         }
     }
     fn send(&self, action: Action) {
@@ -242,7 +244,11 @@ impl App {
             return false;
         }
         if self.details_open {
-            self.details_open = false;
+            match key.code {
+                KeyCode::Up => self.details_scroll = self.details_scroll.saturating_sub(1),
+                KeyCode::Down => self.details_scroll = self.details_scroll.saturating_add(1),
+                _ => self.details_open = false,
+            }
             return true;
         }
         if self.auth_open {
@@ -316,7 +322,10 @@ impl App {
             KeyCode::Char('/') => self.focus = Focus::Search,
             KeyCode::Char('g') => self.auth_open = true,
             KeyCode::Char('l') => self.lyrics_open = true,
-            KeyCode::Char('e') => self.details_open = true,
+            KeyCode::Char('e') => {
+                self.details_scroll = 0;
+                self.details_open = true;
+            }
             KeyCode::Char('s') => self.send(Action::Stop),
             KeyCode::Char(' ') if self.focus != Focus::Controls => self.send(Action::Toggle),
             KeyCode::Char('n') => self.send(Action::Next),
@@ -631,7 +640,8 @@ fn draw(frame: &mut Frame, app: &App) {
         frame.render_widget(
             Paragraph::new(app.message.as_str())
                 .wrap(ratatui::widgets::Wrap { trim: false })
-                .block(panel(" Сообщение · любая клавиша закрывает ", true)),
+                .scroll((app.details_scroll, 0))
+                .block(panel(" Сообщение · ↑↓ прокрутка · Esc закрыть ", true)),
             popup,
         );
     }
