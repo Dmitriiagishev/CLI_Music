@@ -210,6 +210,14 @@ impl Player {
                     "bestaudio[protocol^=m3u8]",
                 ]);
             } else {
+                // The authenticated Music client can use a PO-token provider.
+                // Restrict this to Music URLs so direct YouTube links keep
+                // yt-dlp's usual selection of clients.
+                if url.starts_with("https://music.youtube.com/")
+                    && (auth.browser.is_some() || auth.cookies.is_some())
+                {
+                    extract.args(["--extractor-args", "youtube:player_client=web_music"]);
+                }
                 extract.args(["-f", "bestaudio/best"]);
             }
             extract.args(["-o", "-", "--", url]);
@@ -420,7 +428,10 @@ fn is_forbidden(logs: &str) -> bool {
     })
 }
 fn forbidden_retry(mode: AudioMode, logs: &str) -> Option<AudioMode> {
-    if !is_forbidden(logs) {
+    let unavailable = logs
+        .to_ascii_lowercase()
+        .contains("requested format is not available");
+    if !is_forbidden(logs) && !(mode == AudioMode::Pipe && unavailable) {
         return None;
     }
     match mode {
@@ -550,15 +561,20 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
                     {
                         let error = logs
                             .lines()
-                            .find(|line| is_forbidden(line))
-                            .unwrap_or("HTTP 403 Forbidden");
+                            .find(|line| {
+                                is_forbidden(line)
+                                    || line
+                                        .to_ascii_lowercase()
+                                        .contains("requested format is not available")
+                            })
+                            .unwrap_or("Формат недоступен");
                         let previous = active
                             .initial_error
                             .as_deref()
                             .unwrap_or("HTTP 403 Forbidden");
                         let previous = format!("{previous}\nПовтор через yt-dlp: {error}");
                         let _ = events.send(Event::Message(
-                            "Повтор вернул 403; пробуем аудио HLS через yt-dlp…".into(),
+                            "Повтор не удался; пробуем аудио HLS через yt-dlp…".into(),
                         ));
                         match Player::start(
                             &active.track_url,
@@ -768,7 +784,7 @@ mod tests {
     }
 
     #[test]
-    fn forbidden_retries_are_bounded_and_only_for_403() {
+    fn stream_retries_are_bounded() {
         assert!(matches!(
             forbidden_retry(AudioMode::Default, "HTTP error 403"),
             Some(AudioMode::Pipe)
@@ -778,6 +794,10 @@ mod tests {
             Some(AudioMode::HlsPipe)
         ));
         assert!(forbidden_retry(AudioMode::HlsPipe, "HTTP 403").is_none());
+        assert!(matches!(
+            forbidden_retry(AudioMode::Pipe, "ERROR: Requested format is not available"),
+            Some(AudioMode::HlsPipe)
+        ));
         assert!(forbidden_retry(AudioMode::Pipe, "Sign in to confirm you are not a bot").is_none());
     }
 
