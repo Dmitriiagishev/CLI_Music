@@ -1,306 +1,477 @@
-use std::collections::VecDeque;
-use std::env;
-use std::io::{self, BufRead, Write};
-use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread;
-use std::time::Duration;
+mod backend;
 
-#[derive(Clone, Debug)]
-struct Track {
-    title: String,
-    url: String,
-}
+use backend::{Action, Auth, Event, State, Track};
+use crossterm::{
+    event::{self, Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    Frame, Terminal,
+};
+use std::{
+    env,
+    io::{self, IsTerminal},
+    sync::mpsc::{self, Sender},
+    thread,
+    time::Duration,
+};
+use unicode_width::UnicodeWidthStr;
 
-#[derive(Clone, Default)]
-struct Auth {
-    browser: Option<String>,
-    cookies: Option<String>,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    Search,
+    Results,
+    Queue,
+    Controls,
 }
-impl Auth {
-    fn apply(&self, cmd: &mut Command) {
-        if let Some(browser) = &self.browser {
-            cmd.args(["--cookies-from-browser", browser]);
-        }
-        if let Some(path) = &self.cookies {
-            cmd.args(["--cookies", path]);
+struct App {
+    auth: Auth,
+    actions: Sender<Action>,
+    events: Sender<Event>,
+    input: String,
+    focus: Focus,
+    results: Vec<Track>,
+    selected: usize,
+    queue_selected: usize,
+    button: usize,
+    state: State,
+    message: String,
+    search_id: u64,
+    searching: bool,
+}
+impl App {
+    fn new(auth: Auth, actions: Sender<Action>, events: Sender<Event>) -> Self {
+        Self {
+            auth,
+            actions,
+            events,
+            input: String::new(),
+            focus: Focus::Search,
+            results: vec![],
+            selected: 0,
+            queue_selected: 0,
+            button: 0,
+            state: State::default(),
+            message: "Введите запрос или ссылку и нажмите Enter".into(),
+            search_id: 0,
+            searching: false,
         }
     }
-}
-
-fn parse_tracks(output: &str) -> Vec<Track> {
-    output
-        .lines()
-        .filter_map(|line| {
-            let (id, title) = line.split_once('\t')?;
-            if id.is_empty() || title.is_empty() {
-                return None;
+    fn send(&self, action: Action) {
+        let _ = self.actions.send(action);
+    }
+    fn search(&mut self) {
+        let query = self.input.trim().to_owned();
+        if query.is_empty() {
+            self.message = "Введите запрос или ссылку".into();
+            return;
+        }
+        self.search_id = self.search_id.wrapping_add(1);
+        let id = self.search_id;
+        self.searching = true;
+        self.message = "Ищем…".into();
+        let auth = self.auth.clone();
+        let events = self.events.clone();
+        thread::spawn(move || {
+            let result = backend::lookup(&query, &auth);
+            let _ = events.send(Event::Search(id, result));
+        });
+    }
+    fn handle_event(&mut self, event: Event) {
+        match event {
+            Event::State(state) => {
+                self.state = state;
+                self.queue_selected = self
+                    .queue_selected
+                    .min(self.state.queue.len().saturating_sub(1));
             }
-            let url = if id.starts_with("https://") || id.starts_with("http://") {
-                id.to_owned()
-            } else {
-                format!("https://www.youtube.com/watch?v={id}")
-            };
-            Some(Track {
-                title: title.to_owned(),
-                url,
-            })
-        })
-        .collect()
-}
-
-fn lookup(query: &str, auth: &Auth) -> Result<Vec<Track>, String> {
-    let mut cmd = Command::new("yt-dlp");
-    auth.apply(&mut cmd);
-    let target = if query.starts_with("https://") || query.starts_with("http://") {
-        query.to_owned()
-    } else {
-        format!("ytsearch10:{query}")
-    };
-    let output = cmd
-        .args([
-            "--ignore-config",
-            "--flat-playlist",
-            "--print",
-            "%(id)s\t%(title)s",
-            "--",
-            &target,
-        ])
-        .output()
-        .map_err(|e| format!("Не удалось запустить yt-dlp: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "Ошибка yt-dlp: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let warnings = String::from_utf8_lossy(&output.stderr);
-    if !warnings.trim().is_empty() {
-        eprintln!("{}", warnings.trim());
-    }
-    Ok(parse_tracks(&String::from_utf8_lossy(&output.stdout)))
-}
-
-enum Action {
-    Add(Vec<Track>),
-    Toggle,
-    Next,
-    Stop,
-    Volume(i32),
-    List,
-    Quit,
-}
-
-fn resolve(track: &Track, auth: &Auth) -> Result<String, String> {
-    let mut cmd = Command::new("yt-dlp");
-    auth.apply(&mut cmd);
-    let out = cmd
-        .args([
-            "--ignore-config",
-            "--no-playlist",
-            "--no-warnings",
-            "-f",
-            "bestaudio/best",
-            "-g",
-            "--",
-            &track.url,
-        ])
-        .output()
-        .map_err(|e| format!("Не удалось запустить yt-dlp: {e}"))?;
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_owned());
-    }
-    let url = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_owned();
-    if url.is_empty() {
-        Err("yt-dlp не вернул аудиопоток".into())
-    } else {
-        Ok(url)
-    }
-}
-
-static NEXT_PLAYER: AtomicU64 = AtomicU64::new(0);
-
-struct Player {
-    child: Child,
-    endpoint: String,
-    #[cfg(unix)]
-    directory: std::path::PathBuf,
-}
-
-impl Player {
-    fn start(url: &str, volume: i32) -> io::Result<Self> {
-        let id = NEXT_PLAYER.fetch_add(1, Ordering::Relaxed);
-        let name = format!("cli-music-{}-{id}", std::process::id());
-        #[cfg(unix)]
-        let (endpoint, directory) = {
-            use std::os::unix::fs::DirBuilderExt;
-            let dir = env::temp_dir().join(&name);
-            std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
-            (dir.join("mpv.sock").to_string_lossy().into_owned(), dir)
-        };
-        #[cfg(windows)]
-        let endpoint = format!(r"\\.\pipe\{name}");
-        let child = Command::new("mpv")
-            .args([
-                "--no-video",
-                "--input-terminal=no",
-                "--msg-level=all=warn",
-                &format!("--input-ipc-server={endpoint}"),
-                &format!("--volume={volume}"),
-                "--",
-                url,
-            ])
-            .stdin(Stdio::null())
-            .spawn();
-        match child {
-            Ok(child) => Ok(Self {
-                child,
-                endpoint,
-                #[cfg(unix)]
-                directory,
-            }),
-            Err(e) => {
-                #[cfg(unix)]
-                let _ = std::fs::remove_dir(&directory);
-                Err(e)
-            }
-        }
-    }
-
-    fn command(&self, command: &str) {
-        // mpv creates the endpoint asynchronously after startup.
-        for _ in 0..20 {
-            #[cfg(unix)]
-            let connection = std::os::unix::net::UnixStream::connect(&self.endpoint);
-            #[cfg(windows)]
-            let connection = std::fs::OpenOptions::new().write(true).open(&self.endpoint);
-            if let Ok(mut connection) = connection {
-                if let Err(e) = writeln!(connection, "{command}") {
-                    eprintln!("Не удалось отправить команду mpv: {e}");
-                }
-                return;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        eprintln!("Не удалось подключиться к управлению mpv.");
-    }
-}
-impl Drop for Player {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        #[cfg(unix)]
-        {
-            let _ = std::fs::remove_file(&self.endpoint);
-            let _ = std::fs::remove_dir(&self.directory);
-        }
-    }
-}
-fn stop_player(player: &mut Option<Player>) {
-    // Dropping the player terminates it and removes its private IPC directory.
-    *player = None;
-}
-fn player_loop(rx: Receiver<Action>, auth: Auth) {
-    let mut queue = VecDeque::<Track>::new();
-    let mut player: Option<Player> = None;
-    let mut current: Option<Track> = None;
-    let mut volume = 100i32;
-    loop {
-        if let Some(active) = player.as_mut() {
-            match active.child.try_wait() {
-                Ok(Some(status)) => {
-                    if !status.success() {
-                        eprintln!("\nmpv завершился с ошибкой: {status}");
+            Event::Message(message) => self.message = message,
+            Event::Search(id, result) if id == self.search_id => {
+                self.searching = false;
+                match result {
+                    Ok((tracks, warning)) => {
+                        self.results = tracks;
+                        self.selected = 0;
+                        self.message = if !warning.is_empty() {
+                            warning
+                        } else if self.results.is_empty() {
+                            "Ничего не найдено".into()
+                        } else {
+                            format!(
+                                "Найдено: {}. Enter — слушать, A — в очередь",
+                                self.results.len()
+                            )
+                        };
+                        if !self.results.is_empty() {
+                            self.focus = Focus::Results;
+                        }
                     }
-                    player = None;
-                    current = None;
+                    Err(error) => {
+                        self.results.clear();
+                        self.message = error;
+                    }
                 }
-                Err(e) => {
-                    eprintln!("\nОшибка mpv: {e}");
-                    stop_player(&mut player);
-                    current = None;
+            }
+            Event::Search(_, _) => {}
+        }
+    }
+    fn cycle_focus(&mut self, reverse: bool) {
+        self.focus = match (self.focus, reverse) {
+            (Focus::Search, false) | (Focus::Queue, true) => Focus::Results,
+            (Focus::Results, false) | (Focus::Controls, true) => Focus::Queue,
+            (Focus::Queue, false) | (Focus::Search, true) => Focus::Controls,
+            _ => Focus::Search,
+        };
+    }
+    fn activate_button(&self) {
+        match self.button {
+            0 => self.send(Action::Toggle),
+            1 => self.send(Action::Next),
+            2 => self.send(Action::Stop),
+            3 => self.send(Action::Volume(-10)),
+            _ => self.send(Action::Volume(10)),
+        }
+    }
+    fn key(&mut self, key: KeyEvent) -> bool {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            return false;
+        }
+        if key.code == KeyCode::Tab {
+            self.cycle_focus(false);
+            return true;
+        }
+        if key.code == KeyCode::BackTab {
+            self.cycle_focus(true);
+            return true;
+        }
+        if self.focus == Focus::Search {
+            match key.code {
+                KeyCode::Esc => self.focus = Focus::Results,
+                KeyCode::Enter => self.search(),
+                KeyCode::Backspace => {
+                    self.input.pop();
                 }
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.input.push(c)
+                }
+                KeyCode::Down => self.focus = Focus::Results,
                 _ => {}
             }
+            return true;
         }
-        if player.is_none() {
-            if let Some(track) = queue.pop_front() {
-                println!("\n▶ {}", track.title);
-                match resolve(&track, &auth) {
-                    Ok(url) => match Player::start(&url, volume) {
-                        Ok(active) => {
-                            player = Some(active);
-                            current = Some(track);
-                        }
-                        Err(e) => eprintln!("Не удалось запустить mpv: {e}"),
-                    },
-                    Err(e) => eprintln!("Не удалось получить поток: {e}"),
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => return false,
+            KeyCode::Char('/') => self.focus = Focus::Search,
+            KeyCode::Char(' ') if self.focus != Focus::Controls => self.send(Action::Toggle),
+            KeyCode::Char('n') => self.send(Action::Next),
+            KeyCode::Char('+') | KeyCode::Char('=') => self.send(Action::Volume(10)),
+            KeyCode::Char('-') => self.send(Action::Volume(-10)),
+            KeyCode::Char('a') if self.focus == Focus::Results => {
+                if let Some(track) = self.results.get(self.selected) {
+                    self.send(Action::Add(vec![track.clone()]));
+                    self.message = format!("Добавлено: {}", track.title);
                 }
-                continue;
             }
+            KeyCode::Char('A') if self.focus == Focus::Results => {
+                if !self.results.is_empty() {
+                    self.send(Action::Add(self.results.clone()));
+                    self.message = format!("Добавлено в очередь: {}", self.results.len());
+                }
+            }
+            KeyCode::Delete | KeyCode::Char('d') if self.focus == Focus::Queue => {
+                if !self.state.queue.is_empty() {
+                    self.send(Action::Remove(self.queue_selected));
+                }
+            }
+            KeyCode::Up => match self.focus {
+                Focus::Results if self.selected == 0 => self.focus = Focus::Search,
+                Focus::Results => self.selected = self.selected.saturating_sub(1),
+                Focus::Queue => self.queue_selected = self.queue_selected.saturating_sub(1),
+                Focus::Controls => self.focus = Focus::Queue,
+                _ => {}
+            },
+            KeyCode::Down => match self.focus {
+                Focus::Results => {
+                    self.selected = (self.selected + 1).min(self.results.len().saturating_sub(1))
+                }
+                Focus::Queue => {
+                    if self.queue_selected + 1 >= self.state.queue.len() {
+                        self.focus = Focus::Controls;
+                    } else {
+                        self.queue_selected += 1;
+                    }
+                }
+                Focus::Controls => {}
+                _ => {}
+            },
+            KeyCode::Left => match self.focus {
+                Focus::Queue => self.focus = Focus::Results,
+                Focus::Controls => self.button = self.button.saturating_sub(1),
+                _ => {}
+            },
+            KeyCode::Right => match self.focus {
+                Focus::Results => self.focus = Focus::Queue,
+                Focus::Controls => self.button = (self.button + 1).min(4),
+                _ => {}
+            },
+            KeyCode::Enter => match self.focus {
+                Focus::Results => {
+                    if let Some(track) = self.results.get(self.selected) {
+                        self.send(Action::Play(track.clone()));
+                    }
+                }
+                Focus::Controls => self.activate_button(),
+                _ => {}
+            },
+            KeyCode::Char(' ') if self.focus == Focus::Controls => self.activate_button(),
+            _ => {}
         }
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(Action::Add(tracks)) => {
-                println!("Добавлено: {}", tracks.len());
-                queue.extend(tracks);
-            }
-            Ok(Action::Toggle) => {
-                if let Some(active) = player.as_mut() {
-                    active.command("cycle pause");
-                } else {
-                    println!("Сейчас ничего не играет.");
-                }
-            }
-            Ok(Action::Next) => {
-                stop_player(&mut player);
-                current = None;
-            }
-            Ok(Action::Stop) => {
-                stop_player(&mut player);
-                current = None;
-                queue.clear();
-                println!("Воспроизведение остановлено, очередь очищена.");
-            }
-            Ok(Action::Volume(delta)) => {
-                volume = (volume + delta).clamp(0, 100);
-                if let Some(active) = player.as_mut() {
-                    active.command(&format!("set volume {volume}"));
-                }
-                println!("Громкость: {volume}%");
-            }
-            Ok(Action::List) => {
-                if let Some(track) = &current {
-                    println!("Сейчас: {}", track.title);
-                } else {
-                    println!("Сейчас ничего не играет.");
-                }
-                if queue.is_empty() {
-                    println!("Очередь пуста.");
-                }
-                for (i, track) in queue.iter().enumerate() {
-                    println!("  {}. {}", i + 1, track.title);
-                }
-            }
-            Ok(Action::Quit) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                stop_player(&mut player);
-                break;
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-        }
+        true
     }
 }
 
-fn help() {
-    println!("Команды:\n  search <запрос> — найти музыку\n  add <номер> — добавить результат в очередь\n  play <номер> — остановить очередь и воспроизвести результат\n  url <ссылка> — добавить видео или плейлист\n  queue — показать очередь\n  pause — пауза / продолжить\n  next — следующий трек\n  stop — остановить и очистить очередь\n  volume <+/-число> — изменить громкость\n  help — справка\n  quit — выход");
+fn panel(title: &str, selected: bool) -> Block<'_> {
+    Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if selected {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        }))
 }
-fn send(tx: &Sender<Action>, action: Action) {
-    let _ = tx.send(action);
+fn draw(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    if area.width < 45 || area.height < 18 {
+        frame.render_widget(
+            Paragraph::new("Увеличьте окно терминала (минимум 45 × 18)"),
+            area,
+        );
+        return;
+    }
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(4),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(2),
+        ])
+        .split(area);
+    let header = Line::from(vec![
+        Span::styled(
+            "  CLI MUSIC  ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("   музыка в терминале", Style::default().fg(Color::Gray)),
+    ]);
+    frame.render_widget(Paragraph::new(header).block(panel("", false)), rows[0]);
+    let search = if app.input.is_empty() {
+        "Введите название, исполнителя или ссылку…"
+    } else {
+        &app.input
+    };
+    let visible_width = rows[1].width.saturating_sub(2) as usize;
+    let input_width = UnicodeWidthStr::width(app.input.as_str());
+    let scroll = input_width.saturating_sub(visible_width.saturating_sub(1));
+    frame.render_widget(
+        Paragraph::new(search)
+            .scroll((0, scroll.min(u16::MAX as usize) as u16))
+            .style(Style::default().fg(if app.input.is_empty() {
+                Color::DarkGray
+            } else {
+                Color::White
+            }))
+            .block(panel(
+                if app.searching {
+                    " Поиск · загрузка… "
+                } else {
+                    " Поиск · Enter "
+                },
+                app.focus == Focus::Search,
+            )),
+        rows[1],
+    );
+    if app.focus == Focus::Search && visible_width > 0 {
+        frame.set_cursor_position((rows[1].x + 1 + (input_width - scroll) as u16, rows[1].y + 1));
+    }
+
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(rows[2]);
+    let highlight = Style::default()
+        .bg(Color::DarkGray)
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+    let results: Vec<ListItem> = app
+        .results
+        .iter()
+        .map(|t| ListItem::new(t.title.as_str()))
+        .collect();
+    let mut rs = ListState::default();
+    if !results.is_empty() {
+        rs.select(Some(app.selected));
+    }
+    frame.render_stateful_widget(
+        List::new(results)
+            .block(panel(
+                &format!(" Результаты · {} ", app.results.len()),
+                app.focus == Focus::Results,
+            ))
+            .highlight_style(highlight)
+            .highlight_symbol("▸ "),
+        columns[0],
+        &mut rs,
+    );
+    let queue: Vec<ListItem> = app
+        .state
+        .queue
+        .iter()
+        .map(|t| ListItem::new(t.title.as_str()))
+        .collect();
+    let mut qs = ListState::default();
+    if !queue.is_empty() {
+        qs.select(Some(app.queue_selected));
+    }
+    frame.render_stateful_widget(
+        List::new(queue)
+            .block(panel(
+                &format!(" Очередь · {} ", app.state.queue.len()),
+                app.focus == Focus::Queue,
+            ))
+            .highlight_style(highlight)
+            .highlight_symbol("▸ "),
+        columns[1],
+        &mut qs,
+    );
+    let status = if app.state.loading {
+        "Загрузка"
+    } else if app.state.paused {
+        "Пауза"
+    } else if app.state.current.is_some() {
+        "Играет"
+    } else {
+        "Остановлено"
+    };
+    let title = app
+        .state
+        .current
+        .as_ref()
+        .map(|t| t.title.as_str())
+        .unwrap_or("Выберите трек");
+    frame.render_widget(
+        Paragraph::new(format!(
+            " {status}  ·  {title}  ·  Громкость {}%",
+            app.state.volume
+        ))
+        .block(panel(" Сейчас ", false)),
+        rows[3],
+    );
+    let labels = [
+        if app.state.paused {
+            "▶ Продолжить"
+        } else {
+            "Ⅱ Пауза"
+        },
+        "⏭ Далее",
+        "■ Стоп",
+        "− Тише",
+        "+ Громче",
+    ];
+    let spans: Vec<Span> = labels
+        .iter()
+        .enumerate()
+        .map(|(i, label)| {
+            Span::styled(
+                format!(" {label} "),
+                if app.focus == Focus::Controls && app.button == i {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                },
+            )
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).block(panel(
+            " Управление · ← → Enter ",
+            app.focus == Focus::Controls,
+        )),
+        rows[4],
+    );
+    let footer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .split(rows[5]);
+    frame.render_widget(
+        Paragraph::new(app.message.replace(['\n', '\r'], " "))
+            .style(Style::default().fg(Color::Gray)),
+        footer[0],
+    );
+    frame.render_widget(Paragraph::new("Tab: панели  /: поиск  ↑↓: выбор  Enter: играть  A: очередь  Space: пауза  N: далее  Q: выход").style(Style::default().fg(Color::Gray)), footer[1]);
+}
+
+struct TerminalGuard;
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    }
+}
+fn run(auth: Auth) -> io::Result<()> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err(io::Error::other(
+            "Для интерфейса нужен интерактивный терминал",
+        ));
+    }
+    enable_raw_mode()?;
+    let _guard = TerminalGuard;
+    execute!(io::stdout(), EnterAlternateScreen)?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let (actions, action_rx) = mpsc::channel();
+    let (events, event_rx) = mpsc::channel();
+    let worker_auth = auth.clone();
+    let worker_events = events.clone();
+    let worker = thread::spawn(move || backend::player_loop(action_rx, worker_events, worker_auth));
+    let mut app = App::new(auth, actions, events);
+    let result = (|| -> io::Result<()> {
+        loop {
+            while let Ok(event) = event_rx.try_recv() {
+                app.handle_event(event);
+            }
+            terminal.draw(|frame| draw(frame, &app))?;
+            if event::poll(Duration::from_millis(100))? {
+                if let TermEvent::Key(key) = event::read()? {
+                    if key.kind != KeyEventKind::Release && !app.key(key) {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    })();
+    app.send(Action::Quit);
+    let _ = worker.join();
+    result
 }
 fn main() {
     let mut auth = Auth::default();
@@ -310,7 +481,7 @@ fn main() {
             "--browser" => auth.browser = args.next(),
             "--cookies" => auth.cookies = args.next(),
             "--help" | "-h" => {
-                println!("cli-music [--browser ИМЯ] [--cookies ПУТЬ]\n\nВход через cookies браузера или файл cookies в формате Netscape.\nНапример: cli-music --browser firefox");
+                println!("cli-music [--browser ИМЯ] [--cookies ПУТЬ]\nВход через cookies браузера или файл cookies в формате Netscape.");
                 return;
             }
             _ => {
@@ -329,88 +500,82 @@ fn main() {
         eprintln!("Выберите --browser или --cookies.");
         std::process::exit(2);
     }
-    let (tx, rx) = mpsc::channel();
-    let worker_auth = auth.clone();
-    let worker = thread::spawn(move || player_loop(rx, worker_auth));
-    let mut results: Vec<Track> = Vec::new();
-    println!("CLI Music — поиск и прослушивание музыки. Введите help для списка команд.");
-    let stdin = io::stdin();
-    loop {
-        print!("\n> ");
-        let _ = io::stdout().flush();
-        let mut line = String::new();
-        match stdin.lock().read_line(&mut line) {
-            Ok(0) | Err(_) => break,
-            _ => {}
-        }
-        let line = line.trim();
-        let (command, argument) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
-        let argument = argument.trim();
-        match command {
-            "search" | "url" if !argument.is_empty() => {
-                if command == "url"
-                    && !(argument.starts_with("https://") || argument.starts_with("http://"))
-                {
-                    eprintln!("Введите ссылку http или https.");
-                    continue;
-                }
-                println!("Загрузка…");
-                match lookup(argument, &auth) {
-                    Ok(tracks) if tracks.is_empty() => {
-                        results.clear();
-                        println!("Ничего не найдено. Проверьте запрос или сообщения yt-dlp выше.");
-                    }
-                    Ok(tracks) if command == "url" => send(&tx, Action::Add(tracks)),
-                    Ok(tracks) => {
-                        results = tracks;
-                        for (i, t) in results.iter().enumerate() {
-                            println!("{}. {}", i + 1, t.title);
-                        }
-                    }
-                    Err(e) => eprintln!("{e}"),
-                }
-            }
-            "add" | "play" => match argument
-                .parse::<usize>()
-                .ok()
-                .and_then(|n| n.checked_sub(1))
-                .and_then(|n| results.get(n))
-            {
-                Some(track) => {
-                    if command == "play" {
-                        send(&tx, Action::Stop);
-                    }
-                    send(&tx, Action::Add(vec![track.clone()]));
-                }
-                None => println!("Укажите номер из последнего поиска."),
-            },
-            "queue" => send(&tx, Action::List),
-            "pause" => send(&tx, Action::Toggle),
-            "next" => send(&tx, Action::Next),
-            "stop" => send(&tx, Action::Stop),
-            "volume" => match argument.parse::<i32>() {
-                Ok(n) if (-100..=100).contains(&n) => send(&tx, Action::Volume(n)),
-                _ => println!("Укажите изменение от -100 до +100, например volume -10."),
-            },
-            "help" => help(),
-            "quit" | "exit" => break,
-            "" => {}
-            _ => println!("Неизвестная команда. Введите help."),
-        }
+    if let Err(e) = run(auth) {
+        eprintln!("Ошибка: {e}");
+        std::process::exit(1);
     }
-    send(&tx, Action::Quit);
-    let _ = worker.join();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_app() -> (App, mpsc::Receiver<Action>) {
+        let (actions, rx) = mpsc::channel();
+        let (events, _) = mpsc::channel();
+        (App::new(Auth::default(), actions, events), rx)
+    }
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
     #[test]
-    fn parses_search_results_and_preserves_titles() {
-        let tracks = parse_tracks("abc123\tArtist — Song\ninvalid\nhttps://example.org/v\tOther\n");
-        assert_eq!(tracks.len(), 2);
-        assert_eq!(tracks[0].url, "https://www.youtube.com/watch?v=abc123");
-        assert_eq!(tracks[0].title, "Artist — Song");
-        assert_eq!(tracks[1].url, "https://example.org/v");
+    fn arrows_select_track_and_enter_plays_it() {
+        let (mut app, rx) = make_app();
+        app.results = vec![
+            Track {
+                title: "one".into(),
+                url: "one".into(),
+            },
+            Track {
+                title: "two".into(),
+                url: "two".into(),
+            },
+        ];
+        app.key(press(KeyCode::Down));
+        app.key(press(KeyCode::Down));
+        app.key(press(KeyCode::Enter));
+        match rx.try_recv().unwrap() {
+            Action::Play(track) => assert_eq!(track.title, "two"),
+            _ => panic!("expected playback"),
+        }
+    }
+
+    #[test]
+    fn space_and_control_button_both_toggle_pause() {
+        let (mut app, rx) = make_app();
+        app.focus = Focus::Results;
+        app.key(press(KeyCode::Char(' ')));
+        app.focus = Focus::Controls;
+        app.key(press(KeyCode::Enter));
+        assert!(matches!(rx.try_recv(), Ok(Action::Toggle)));
+        assert!(matches!(rx.try_recv(), Ok(Action::Toggle)));
+    }
+
+    #[test]
+    fn older_search_response_cannot_replace_new_results() {
+        let (mut app, _) = make_app();
+        app.search_id = 2;
+        app.handle_event(Event::Search(
+            2,
+            Ok((
+                vec![Track {
+                    title: "new".into(),
+                    url: "url".into(),
+                }],
+                String::new(),
+            )),
+        ));
+        app.handle_event(Event::Search(
+            1,
+            Ok((
+                vec![Track {
+                    title: "old".into(),
+                    url: "url".into(),
+                }],
+                String::new(),
+            )),
+        ));
+        assert_eq!(app.results[0].title, "new");
     }
 }
