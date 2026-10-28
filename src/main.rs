@@ -754,7 +754,7 @@ fn result_row(index: usize, artists: usize, total: usize) -> usize {
 fn main_layout(area: Rect) -> (std::rc::Rc<[Rect]>, std::rc::Rc<[Rect]>) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
         .split(area);
     let left = Layout::default()
         .direction(Direction::Vertical)
@@ -1172,21 +1172,22 @@ fn draw_spectrum(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         return;
     }
     let bands = spectrum::BANDS as u16;
-    let bar_width = (inner.width / (bands * 3)).max(1);
+    let bar_width = 1;
     let gap = (inner.width - bar_width * bands) / (bands - 1);
     let used = bar_width * bands + gap * (bands - 1);
     let start = inner.x + (inner.width - used) / 2;
     let height = inner.height.min(12);
     for index in 0..spectrum::BANDS {
-        let lit = (app.levels[index] * 12.0).round() as u16;
+        let lit = (app.levels[index].clamp(0.0, 1.0) * 24.0).round() as u16;
         for row in 0..height {
-            let bottom = ((height - row) * 12 + height - 1) / height;
+            let top = ((height - row) * 24 + height - 1) / height;
+            let bottom = ((height - row - 1) * 24 + height - 1) / height + 1;
             if bottom > lit {
                 continue;
             }
-            let fraction = f32::from(bottom) / 12.0;
+            let fraction = f32::from(top.min(lit)) / 24.0;
             let color = spectrum_color(fraction);
-            let segment = "─".repeat(usize::from(bar_width));
+            let segment = if lit >= top { "═" } else { "─" };
             frame.render_widget(
                 Paragraph::new(segment).style(Style::default().fg(color)),
                 ratatui::layout::Rect::new(
@@ -1421,7 +1422,7 @@ mod tests {
         assert_eq!(spectrum_color(0.9), Color::Rgb(121, 44, 67));
     }
     #[test]
-    fn spectrum_has_equal_bars_and_twelve_segments() {
+    fn spectrum_has_equal_bars_and_twenty_four_strokes() {
         let (mut app, _) = make_app();
         app.levels = [1.0; spectrum::BANDS];
         let backend = ratatui::backend::TestBackend::new(55, 14);
@@ -1436,10 +1437,31 @@ mod tests {
                 .collect();
             let bars: Vec<_> = row.split_whitespace().collect();
             assert_eq!(bars.len(), 20);
-            assert!(bars
-                .iter()
-                .all(|bar| bar.chars().count() == bars[0].chars().count()));
+            assert!(bars.iter().all(|bar| *bar == "═"));
         }
+    }
+    #[test]
+    fn spectrum_renders_single_half_segment_and_spreads_columns() {
+        let (mut app, _) = make_app();
+        app.levels[0] = 1.0 / 24.0;
+        app.levels[1] = 2.0 / 24.0;
+        let backend = ratatui::backend::TestBackend::new(82, 14);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_spectrum(frame, frame.area(), &app))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let row: String = (1..81)
+            .map(|x| buffer.cell((x, 12)).unwrap().symbol())
+            .collect();
+        let single = row.find('─').unwrap();
+        let double = row.find('═').unwrap();
+        let gap = row[single + '─'.len_utf8()..double].chars().count();
+        assert!(gap >= 3, "gap was {gap}");
+        let row_above: String = (1..81)
+            .map(|x| buffer.cell((x, 11)).unwrap().symbol())
+            .collect();
+        assert!(!row_above.contains('═') && !row_above.contains('─'));
     }
     #[test]
     fn ctrl_arrows_reach_controls_and_mouse_activates_pause() {

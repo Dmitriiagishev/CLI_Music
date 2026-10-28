@@ -747,7 +747,7 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
                 _ => {}
             }
         }
-        if last_spectrum.elapsed() >= Duration::from_millis(200) {
+        if last_spectrum.elapsed() >= Duration::from_millis(100) {
             if state.loading && player.as_ref().is_some_and(|p| p.playback_started()) {
                 state.loading = false;
                 let _ = events.send(Event::Message(String::new()));
@@ -830,7 +830,7 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
         } else if queue.is_empty() {
             preload = None;
         }
-        match rx.recv_timeout(Duration::from_millis(100)) {
+        match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(Action::Add(tracks)) => queue.extend(tracks),
             Ok(Action::PlayNext(track)) => queue.push_front(track),
             Ok(Action::PlayList(tracks)) => {

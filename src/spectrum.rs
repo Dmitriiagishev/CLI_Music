@@ -39,7 +39,7 @@ impl Spectrum {
             {
                 return None;
             }
-            graph.push_str(&format!(";[s{index}]bandpass=f={frequency}:width_type=o:width=1,asetnsamples=n=8192:p=0,astats=metadata=1:reset=1,ametadata=mode=print:key=lavfi.astats.Overall.RMS_level:file='{path}':direct=1,anullsink"));
+            graph.push_str(&format!(";[s{index}]bandpass=f={frequency}:width_type=o:width=1,asetnsamples=n=4096:p=0,astats=metadata=1:reset=1,ametadata=mode=print:key=lavfi.astats.Overall.RMS_level:file='{path}':direct=1,anullsink"));
         }
         graph.push_str(";[main]anull");
         Some(graph)
