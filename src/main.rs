@@ -1,4 +1,5 @@
 mod backend;
+mod cover;
 
 use backend::{Action, Auth, Event, State, Track};
 use crossterm::{
@@ -11,7 +12,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
     Frame, Terminal,
 };
 use std::{
@@ -44,6 +45,12 @@ struct App {
     message: String,
     search_id: u64,
     searching: bool,
+    queue_open: bool,
+    previous_focus: Focus,
+    cover_url: Option<String>,
+    cover_id: u64,
+    cover: Option<image::RgbImage>,
+    cover_status: String,
 }
 impl App {
     fn new(auth: Auth, actions: Sender<Action>, events: Sender<Event>) -> Self {
@@ -61,6 +68,12 @@ impl App {
             message: "Введите запрос или ссылку и нажмите Enter".into(),
             search_id: 0,
             searching: false,
+            queue_open: false,
+            previous_focus: Focus::Search,
+            cover_url: None,
+            cover_id: 0,
+            cover: None,
+            cover_status: "Выберите трек".into(),
         }
     }
     fn send(&self, action: Action) {
@@ -86,6 +99,27 @@ impl App {
     fn handle_event(&mut self, event: Event) {
         match event {
             Event::State(state) => {
+                let url = state.current.as_ref().map(|t| t.url.clone());
+                if url != self.cover_url {
+                    self.cover_url = url;
+                    self.cover_id = self.cover_id.wrapping_add(1);
+                    self.cover = None;
+                    self.cover_status = if state.current.is_some() {
+                        "Загрузка обложки…"
+                    } else {
+                        "Выберите трек"
+                    }
+                    .into();
+                    if let Some(track) = state.current.clone() {
+                        let id = self.cover_id;
+                        let auth = self.auth.clone();
+                        let events = self.events.clone();
+                        thread::spawn(move || {
+                            let result = cover::load(&track, &auth);
+                            let _ = events.send(Event::Cover(id, result));
+                        });
+                    }
+                }
                 self.state = state;
                 self.queue_selected = self
                     .queue_selected
@@ -119,22 +153,33 @@ impl App {
                 }
             }
             Event::Search(_, _) => {}
+            Event::Cover(id, result) if id == self.cover_id => match result {
+                Ok(image) => {
+                    self.cover = Some(image);
+                    self.cover_status.clear();
+                }
+                Err(e) => self.cover_status = e,
+            },
+            Event::Cover(_, _) => {}
         }
     }
-    fn cycle_focus(&mut self, reverse: bool) {
-        self.focus = match (self.focus, reverse) {
-            (Focus::Search, false) | (Focus::Queue, true) => Focus::Results,
-            (Focus::Results, false) | (Focus::Controls, true) => Focus::Queue,
-            (Focus::Queue, false) | (Focus::Search, true) => Focus::Controls,
-            _ => Focus::Search,
-        };
+    fn toggle_queue(&mut self) {
+        if self.queue_open {
+            self.queue_open = false;
+            self.focus = self.previous_focus;
+        } else {
+            self.queue_open = true;
+            self.previous_focus = self.focus;
+            self.focus = Focus::Queue;
+        }
     }
     fn activate_button(&self) {
         match self.button {
-            0 => self.send(Action::Toggle),
-            1 => self.send(Action::Next),
-            2 => self.send(Action::Stop),
-            3 => self.send(Action::Volume(-10)),
+            0 => self.send(Action::Previous),
+            1 => self.send(Action::Toggle),
+            2 => self.send(Action::Next),
+            3 => self.send(Action::Stop),
+            4 => self.send(Action::Volume(-10)),
             _ => self.send(Action::Volume(10)),
         }
     }
@@ -142,12 +187,26 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return false;
         }
-        if key.code == KeyCode::Tab {
-            self.cycle_focus(false);
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            self.toggle_queue();
             return true;
         }
-        if key.code == KeyCode::BackTab {
-            self.cycle_focus(true);
+        if self.queue_open {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.toggle_queue(),
+                KeyCode::Up => self.queue_selected = self.queue_selected.saturating_sub(1),
+                KeyCode::Down => {
+                    self.queue_selected =
+                        (self.queue_selected + 1).min(self.state.queue.len().saturating_sub(1))
+                }
+                KeyCode::Delete | KeyCode::Char('d') if !self.state.queue.is_empty() => {
+                    self.send(Action::Remove(self.queue_selected))
+                }
+                KeyCode::Char(' ') => self.send(Action::Toggle),
+                KeyCode::Char('n') => self.send(Action::Next),
+                KeyCode::Char('p') => self.send(Action::Previous),
+                _ => {}
+            }
             return true;
         }
         if self.focus == Focus::Search {
@@ -164,7 +223,13 @@ impl App {
                 {
                     self.input.push(c)
                 }
-                KeyCode::Down => self.focus = Focus::Results,
+                KeyCode::Down => {
+                    self.focus = if self.results.is_empty() {
+                        Focus::Controls
+                    } else {
+                        Focus::Results
+                    }
+                }
                 _ => {}
             }
             return true;
@@ -174,6 +239,7 @@ impl App {
             KeyCode::Char('/') => self.focus = Focus::Search,
             KeyCode::Char(' ') if self.focus != Focus::Controls => self.send(Action::Toggle),
             KeyCode::Char('n') => self.send(Action::Next),
+            KeyCode::Char('p') => self.send(Action::Previous),
             KeyCode::Char('+') | KeyCode::Char('=') => self.send(Action::Volume(10)),
             KeyCode::Char('-') => self.send(Action::Volume(-10)),
             KeyCode::Char('a') if self.focus == Focus::Results => {
@@ -188,42 +254,31 @@ impl App {
                     self.message = format!("Добавлено в очередь: {}", self.results.len());
                 }
             }
-            KeyCode::Delete | KeyCode::Char('d') if self.focus == Focus::Queue => {
-                if !self.state.queue.is_empty() {
-                    self.send(Action::Remove(self.queue_selected));
-                }
-            }
             KeyCode::Up => match self.focus {
                 Focus::Results if self.selected == 0 => self.focus = Focus::Search,
                 Focus::Results => self.selected = self.selected.saturating_sub(1),
-                Focus::Queue => self.queue_selected = self.queue_selected.saturating_sub(1),
-                Focus::Controls => self.focus = Focus::Queue,
+                Focus::Controls => {
+                    self.focus = if self.results.is_empty() {
+                        Focus::Search
+                    } else {
+                        Focus::Results
+                    }
+                }
                 _ => {}
             },
             KeyCode::Down => match self.focus {
-                Focus::Results => {
-                    self.selected = (self.selected + 1).min(self.results.len().saturating_sub(1))
+                Focus::Results if self.selected + 1 >= self.results.len() => {
+                    self.focus = Focus::Controls
                 }
-                Focus::Queue => {
-                    if self.queue_selected + 1 >= self.state.queue.len() {
-                        self.focus = Focus::Controls;
-                    } else {
-                        self.queue_selected += 1;
-                    }
-                }
-                Focus::Controls => {}
+                Focus::Results => self.selected += 1,
                 _ => {}
             },
-            KeyCode::Left => match self.focus {
-                Focus::Queue => self.focus = Focus::Results,
-                Focus::Controls => self.button = self.button.saturating_sub(1),
-                _ => {}
-            },
-            KeyCode::Right => match self.focus {
-                Focus::Results => self.focus = Focus::Queue,
-                Focus::Controls => self.button = (self.button + 1).min(4),
-                _ => {}
-            },
+            KeyCode::Left if self.focus == Focus::Controls => {
+                self.button = self.button.saturating_sub(1)
+            }
+            KeyCode::Right if self.focus == Focus::Controls => {
+                self.button = (self.button + 1).min(5)
+            }
             KeyCode::Enter => match self.focus {
                 Focus::Results => {
                     if let Some(track) = self.results.get(self.selected) {
@@ -339,27 +394,7 @@ fn draw(frame: &mut Frame, app: &App) {
         columns[0],
         &mut rs,
     );
-    let queue: Vec<ListItem> = app
-        .state
-        .queue
-        .iter()
-        .map(|t| ListItem::new(t.title.as_str()))
-        .collect();
-    let mut qs = ListState::default();
-    if !queue.is_empty() {
-        qs.select(Some(app.queue_selected));
-    }
-    frame.render_stateful_widget(
-        List::new(queue)
-            .block(panel(
-                &format!(" Очередь · {} ", app.state.queue.len()),
-                app.focus == Focus::Queue,
-            ))
-            .highlight_style(highlight)
-            .highlight_symbol("▸ "),
-        columns[1],
-        &mut qs,
-    );
+    draw_cover(frame, columns[1], app);
     let status = if app.state.loading {
         "Загрузка"
     } else if app.state.paused {
@@ -383,41 +418,60 @@ fn draw(frame: &mut Frame, app: &App) {
         .block(panel(" Сейчас ", false)),
         rows[3],
     );
-    let labels = [
-        if app.state.paused {
-            "▶ Продолжить"
-        } else {
-            "Ⅱ Пауза"
-        },
-        "⏭ Далее",
-        "■ Стоп",
-        "− Тише",
-        "+ Громче",
-    ];
-    let spans: Vec<Span> = labels
-        .iter()
-        .enumerate()
-        .map(|(i, label)| {
-            Span::styled(
-                format!(" {label} "),
-                if app.focus == Focus::Controls && app.button == i {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::White)
-                },
-            )
-        })
-        .collect();
+    let labels = if rows[4].width < 75 {
+        [
+            "|◀",
+            if app.state.paused { "▶" } else { "Ⅱ" },
+            "▶|",
+            "■",
+            "−",
+            "+",
+        ]
+    } else {
+        [
+            "⏮ Назад",
+            if app.state.paused {
+                "▶ Продолжить"
+            } else {
+                "Ⅱ Пауза"
+            },
+            "⏭ Далее",
+            "■ Стоп",
+            "− Тише",
+            "+ Громче",
+        ]
+    };
+    let buttons = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(16),
+            Constraint::Percentage(24),
+            Constraint::Percentage(16),
+            Constraint::Percentage(15),
+            Constraint::Percentage(14),
+            Constraint::Percentage(15),
+        ])
+        .split(panel("", false).inner(rows[4]));
     frame.render_widget(
-        Paragraph::new(Line::from(spans)).block(panel(
-            " Управление · ← → Enter ",
-            app.focus == Focus::Controls,
-        )),
+        panel(" Управление · ← → Enter ", app.focus == Focus::Controls),
         rows[4],
     );
+    for (i, label) in labels.iter().enumerate() {
+        let style = if app.focus == Focus::Controls && app.button == i {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        frame.render_widget(
+            Paragraph::new(*label)
+                .alignment(ratatui::layout::Alignment::Center)
+                .style(style),
+            buttons[i],
+        );
+    }
     let footer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Length(1)])
@@ -427,7 +481,102 @@ fn draw(frame: &mut Frame, app: &App) {
             .style(Style::default().fg(Color::Gray)),
         footer[0],
     );
-    frame.render_widget(Paragraph::new("Tab: панели  /: поиск  ↑↓: выбор  Enter: играть  A: очередь  Space: пауза  N: далее  Q: выход").style(Style::default().fg(Color::Gray)), footer[1]);
+    frame.render_widget(Paragraph::new("Tab: очередь  /: поиск  ↑↓: выбор  Enter: играть  a: добавить  Space: пауза  P/N: назад/далее  Q: выход").style(Style::default().fg(Color::Gray)), footer[1]);
+    if app.queue_open {
+        let popup = centered(area, 75, 70);
+        frame.render_widget(Clear, popup);
+        let queue: Vec<ListItem> = app
+            .state
+            .queue
+            .iter()
+            .map(|t| ListItem::new(t.title.as_str()))
+            .collect();
+        let mut selection = ListState::default();
+        if !queue.is_empty() {
+            selection.select(Some(app.queue_selected));
+        }
+        frame.render_stateful_widget(
+            List::new(queue)
+                .block(panel(
+                    &format!(
+                        " Очередь · {} · Tab/Esc закрыть · D удалить ",
+                        app.state.queue.len()
+                    ),
+                    true,
+                ))
+                .highlight_style(highlight)
+                .highlight_symbol("▸ "),
+            popup,
+            &mut selection,
+        );
+    }
+}
+
+fn centered(area: ratatui::layout::Rect, width: u16, height: u16) -> ratatui::layout::Rect {
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - height) / 2),
+            Constraint::Percentage(height),
+            Constraint::Percentage((100 - height) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - width) / 2),
+            Constraint::Percentage(width),
+            Constraint::Percentage((100 - width) / 2),
+        ])
+        .split(v[1])[1]
+}
+fn draw_cover(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+    let block = panel(" Обложка ", false);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()) {
+        frame.render_widget(
+            Paragraph::new("Обложка доступна при включённых цветах терминала")
+                .alignment(ratatui::layout::Alignment::Center),
+            inner,
+        );
+        return;
+    }
+    let Some(image) = &app.cover else {
+        frame.render_widget(
+            Paragraph::new(app.cover_status.as_str()).alignment(ratatui::layout::Alignment::Center),
+            inner,
+        );
+        return;
+    };
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let image = image::imageops::thumbnail(image, inner.width as u32, inner.height as u32 * 2);
+    let x = inner.x + (inner.width - image.width() as u16) / 2;
+    let rows = (image.height() as u16).div_ceil(2);
+    let y = inner.y + (inner.height - rows) / 2;
+    for row in 0..rows {
+        let mut spans = Vec::new();
+        for col in 0..image.width() {
+            let top = image
+                .get_pixel(col, (row as u32 * 2).min(image.height() - 1))
+                .0;
+            let bottom = image
+                .get_pixel(col, (row as u32 * 2 + 1).min(image.height() - 1))
+                .0;
+            spans.push(Span::styled(
+                "▀",
+                Style::default()
+                    .fg(Color::Rgb(top[0], top[1], top[2]))
+                    .bg(Color::Rgb(bottom[0], bottom[1], bottom[2])),
+            ));
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)),
+            ratatui::layout::Rect::new(x, y + row, image.width() as u16, 1),
+        );
+    }
 }
 
 struct TerminalGuard;
@@ -547,9 +696,42 @@ mod tests {
         app.focus = Focus::Results;
         app.key(press(KeyCode::Char(' ')));
         app.focus = Focus::Controls;
+        app.button = 1;
         app.key(press(KeyCode::Enter));
         assert!(matches!(rx.try_recv(), Ok(Action::Toggle)));
         assert!(matches!(rx.try_recv(), Ok(Action::Toggle)));
+    }
+
+    #[test]
+    fn queue_opens_on_tab_and_closes_without_losing_focus() {
+        let (mut app, _) = make_app();
+        app.focus = Focus::Results;
+        app.key(press(KeyCode::Tab));
+        assert!(app.queue_open);
+        app.key(press(KeyCode::Esc));
+        assert!(!app.queue_open && app.focus == Focus::Results);
+    }
+
+    #[test]
+    fn arrows_reach_controls_from_search_without_queue() {
+        let (mut app, _) = make_app();
+        app.results = vec![Track {
+            title: "one".into(),
+            url: "one".into(),
+        }];
+        app.key(press(KeyCode::Down));
+        assert!(app.focus == Focus::Results);
+        app.key(press(KeyCode::Down));
+        assert!(app.focus == Focus::Controls);
+        assert!(!app.queue_open);
+    }
+
+    #[test]
+    fn stale_cover_response_is_ignored() {
+        let (mut app, _) = make_app();
+        app.cover_id = 2;
+        app.handle_event(Event::Cover(1, Ok(image::RgbImage::new(1, 1))));
+        assert!(app.cover.is_none());
     }
 
     #[test]

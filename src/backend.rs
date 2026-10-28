@@ -217,6 +217,7 @@ pub struct State {
     pub paused: bool,
     pub loading: bool,
     pub volume: i32,
+    pub can_previous: bool,
 }
 pub enum Action {
     Add(Vec<Track>),
@@ -224,6 +225,7 @@ pub enum Action {
     Remove(usize),
     Toggle,
     Next,
+    Previous,
     Stop,
     Volume(i32),
     Quit,
@@ -232,6 +234,7 @@ pub enum Event {
     State(State),
     Message(String),
     Search(u64, Result<(Vec<Track>, String), String>),
+    Cover(u64, Result<image::RgbImage, String>),
 }
 enum Resolved {
     Ready(u64, Track, Result<String, String>),
@@ -243,6 +246,7 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, auth: Auth) {
         ..State::default()
     };
     let mut queue = VecDeque::new();
+    let mut history = Vec::<Track>::new();
     let mut player: Option<Player> = None;
     let mut generation = 0u64;
     let (rtx, rrx) = mpsc::channel();
@@ -260,6 +264,12 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, auth: Auth) {
                             "mpv завершился с ошибкой: {status}"
                         )));
                     }
+                    if status.success() {
+                        if let Some(track) = state.current.take() {
+                            history.push(track);
+                        }
+                    }
+                    state.can_previous = !history.is_empty();
                     player = None;
                     state.current = None;
                     state.paused = false;
@@ -318,6 +328,12 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, auth: Auth) {
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(Action::Add(tracks)) => queue.extend(tracks),
             Ok(Action::Play(track)) => {
+                if player.is_some() {
+                    if let Some(current) = state.current.take() {
+                        history.push(current);
+                    }
+                }
+                state.can_previous = !history.is_empty();
                 generation = generation.wrapping_add(1);
                 player = None;
                 state.loading = false;
@@ -340,13 +356,36 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, auth: Auth) {
                 }
             }
             Ok(Action::Next) => {
+                if player.is_some() {
+                    if let Some(current) = state.current.take() {
+                        history.push(current);
+                    }
+                }
+                state.can_previous = !history.is_empty();
                 generation = generation.wrapping_add(1);
                 player = None;
                 state.loading = false;
                 state.current = None;
                 state.paused = false;
             }
+            Ok(Action::Previous) => {
+                if let Some(previous) = history.pop() {
+                    if let Some(current) = state.current.take() {
+                        queue.push_front(current);
+                    }
+                    queue.push_front(previous);
+                    generation = generation.wrapping_add(1);
+                    player = None;
+                    state.loading = false;
+                    state.paused = false;
+                    state.can_previous = !history.is_empty();
+                } else {
+                    let _ = events.send(Event::Message("Предыдущего трека пока нет".into()));
+                }
+            }
             Ok(Action::Stop) => {
+                history.clear();
+                state.can_previous = false;
                 generation = generation.wrapping_add(1);
                 player = None;
                 state.loading = false;
