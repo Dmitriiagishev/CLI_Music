@@ -409,7 +409,11 @@ fn draw(frame: &mut Frame, app: &App) {
         .split(area);
     let left = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(4)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(4),
+            Constraint::Length(8),
+        ])
         .split(columns[0]);
     let search = if app.input.is_empty() {
         "Введите название, исполнителя или ссылку…"
@@ -501,11 +505,7 @@ fn draw(frame: &mut Frame, app: &App) {
     );
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(4),
-            Constraint::Length(7),
-            Constraint::Length(8),
-        ])
+        .constraints([Constraint::Min(4), Constraint::Length(8)])
         .split(columns[1]);
     draw_cover(frame, right[0], app);
     let status = if app.state.loading {
@@ -527,8 +527,8 @@ fn draw(frame: &mut Frame, app: &App) {
         " Плеер · G вход · L текст · E сообщение ",
         app.focus == Focus::Controls,
     );
-    let inside = player_block.inner(right[1]);
-    frame.render_widget(player_block, right[1]);
+    let inside = player_block.inner(left[2]);
+    frame.render_widget(player_block, left[2]);
     let player_rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -577,7 +577,7 @@ fn draw(frame: &mut Frame, app: &App) {
             .style(Style::default().fg(Color::Gray)),
         player_rows[3],
     );
-    draw_spectrum(frame, right[2], app);
+    draw_spectrum(frame, right[1], app);
     if app.queue_open {
         let popup = centered(area, 75, 70);
         frame.render_widget(Clear, popup);
@@ -667,60 +667,78 @@ fn centered(area: ratatui::layout::Rect, width: u16, height: u16) -> ratatui::la
         .split(v[1])[1]
 }
 fn draw_cover(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
-    let block = panel(" Обложка ", false);
+    let block = panel("", false);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    if env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()) {
-        frame.render_widget(
-            Paragraph::new("Обложка доступна при включённых цветах терминала")
-                .alignment(ratatui::layout::Alignment::Center),
-            inner,
-        );
-        return;
-    }
-    let Some(image) = &app.cover else {
-        frame.render_widget(
-            Paragraph::new(app.cover_status.as_str()).alignment(ratatui::layout::Alignment::Center),
-            inner,
-        );
-        return;
-    };
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-    let side = inner.width.min(inner.height.saturating_mul(2)).min(22) as u32;
-    if side == 0 {
-        return;
-    }
-    let image = image::imageops::thumbnail(image, side, side);
-    let x = inner.x + (inner.width - image.width() as u16) / 2;
-    let rows = (image.height() as u16).div_ceil(2);
-    let y = inner.y + (inner.height - rows) / 2;
-    for row in 0..rows {
-        let mut spans = Vec::new();
-        for col in 0..image.width() {
-            let top = image
-                .get_pixel(col, (row as u32 * 2).min(image.height() - 1))
-                .0;
-            let bottom = image
-                .get_pixel(col, (row as u32 * 2 + 1).min(image.height() - 1))
-                .0;
-            spans.push(Span::styled(
-                "▀",
-                Style::default()
-                    .fg(Color::Rgb(top[0], top[1], top[2]))
-                    .bg(Color::Rgb(bottom[0], bottom[1], bottom[2])),
-            ));
+    let has_color = !env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
+    let image_rows = if app.cover.is_some() && has_color {
+        inner.height.saturating_sub(3).min(11)
+    } else {
+        1
+    };
+    if let Some(image) = app.cover.as_ref().filter(|_| has_color && image_rows > 0) {
+        let side = inner.width.min(image_rows.saturating_mul(2)).min(22) as u32;
+        if side > 0 {
+            let image = image::imageops::thumbnail(image, side, side);
+            let x = inner.x + (inner.width - image.width() as u16) / 2;
+            let rows = (image.height() as u16).div_ceil(2);
+            for row in 0..rows {
+                let mut spans = Vec::new();
+                for col in 0..image.width() {
+                    let top = image
+                        .get_pixel(col, (row as u32 * 2).min(image.height() - 1))
+                        .0;
+                    let bottom = image
+                        .get_pixel(col, (row as u32 * 2 + 1).min(image.height() - 1))
+                        .0;
+                    spans.push(Span::styled(
+                        "▀",
+                        Style::default()
+                            .fg(Color::Rgb(top[0], top[1], top[2]))
+                            .bg(Color::Rgb(bottom[0], bottom[1], bottom[2])),
+                    ));
+                }
+                frame.render_widget(
+                    Paragraph::new(Line::from(spans)),
+                    ratatui::layout::Rect::new(x, inner.y + row, image.width() as u16, 1),
+                );
+            }
         }
+    } else if image_rows > 0 {
+        let text = if !has_color && app.cover.is_some() {
+            "Для обложки включите цвета терминала"
+        } else {
+            app.cover_status.as_str()
+        };
         frame.render_widget(
-            Paragraph::new(Line::from(spans)),
-            ratatui::layout::Rect::new(x, y + row, image.width() as u16, 1),
+            Paragraph::new(text).alignment(ratatui::layout::Alignment::Center),
+            ratatui::layout::Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+    }
+    let offset = (image_rows + 1).min(inner.height);
+    let text_area = ratatui::layout::Rect::new(
+        inner.x,
+        inner.y + offset,
+        inner.width,
+        inner.height - offset,
+    );
+    if text_area.height > 0 && app.state.current.is_some() {
+        frame.render_widget(
+            Paragraph::new(app.lyrics.as_str())
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .scroll((app.lyrics_scroll, 0))
+                .alignment(ratatui::layout::Alignment::Center)
+                .style(Style::default().fg(Color::Gray)),
+            text_area,
         );
     }
 }
 
 fn draw_spectrum(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
-    let block = panel(" Частоты ", false);
+    let block = panel("", false);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width < spectrum::BANDS as u16 || inner.height == 0 {
@@ -801,7 +819,8 @@ fn run(auth: Auth) -> io::Result<()> {
             while let Ok(event) = event_rx.try_recv() {
                 app.handle_event(event);
             }
-            app.result_limit = usize::from(terminal.size()?.height.saturating_sub(7)).clamp(1, 100);
+            app.result_limit =
+                usize::from(terminal.size()?.height.saturating_sub(15)).clamp(1, 100);
             terminal.draw(|frame| draw(frame, &app))?;
             if event::poll(Duration::from_millis(100))? {
                 if let TermEvent::Key(key) = event::read()? {
@@ -982,6 +1001,48 @@ mod tests {
         assert_eq!(app.auth_selection, 1);
         assert!(rx.try_recv().is_err());
     }
+    #[test]
+    fn layout_places_lyrics_right_and_player_below_results() {
+        let (mut app, _) = make_app();
+        app.state.current = Some(Track {
+            title: "Example".into(),
+            url: "url".into(),
+        });
+        app.lyrics = "First lyric".into();
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let lines: Vec<String> = (0..40)
+            .map(|y| {
+                (0..120)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect()
+            })
+            .collect();
+        let (lyric_row, lyric_text) = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.contains("First lyric"))
+            .unwrap();
+        let (player_row, player_text) = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.contains("Плеер"))
+            .unwrap();
+        let (results_row, _) = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.contains("Результаты"))
+            .unwrap();
+        assert!(lyric_text.find("First lyric").unwrap() >= 72);
+        assert!(player_text.find("Плеер").unwrap() < 72);
+        assert!(player_row > lyric_row && player_row > results_row);
+        assert!(!lines
+            .iter()
+            .any(|line| line.contains("Обложка") || line.contains("Частоты")));
+    }
+
     #[test]
     fn older_search_response_cannot_replace_new_results() {
         let (mut app, _) = make_app();

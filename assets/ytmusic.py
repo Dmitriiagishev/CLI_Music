@@ -25,7 +25,9 @@ def song(item):
 
 def main():
     mode, value = sys.argv[1:3]
-    api = YTMusic(requests_session=TimedSession(), language="ru")
+    # Filtered search in ytmusicapi 1.12.x matches English shelf names
+    # ("Songs", "Artists"). Russian shelf labels are silently discarded.
+    api = YTMusic(requests_session=TimedSession(), language="en")
     if mode == "search":
         limit = max(1, min(int(sys.argv[3]), 100))
         artists = api.search(value, filter="artists", limit=min(5, max(1, limit // 4)))

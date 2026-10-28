@@ -12,7 +12,8 @@ ADAPTER = pathlib.Path(__file__).resolve().parents[1] / "assets" / "ytmusic.py"
 
 class FakeMusic:
     def __init__(self, **kwargs):
-        pass
+        if kwargs.get("language") != "en":
+            raise AssertionError("Filtered ytmusicapi search requires English shelf names")
 
     def search(self, query, filter, limit):
         if filter == "artists":
@@ -41,6 +42,22 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual([entry["type"] for entry in result], ["artist", "track"])
         self.assertEqual(result[0]["url"], "musicartist:UC123")
         self.assertEqual(result[1]["url"], "https://music.youtube.com/watch?v=abc")
+
+    def test_library_drops_russian_filtered_shelves(self):
+        from ytmusicapi import YTMusic
+        response = {"contents": {"sectionListRenderer": {"contents": [{
+            "musicShelfRenderer": {
+                "title": {"runs": [{"text": "Песни"}]},
+                "contents": [{"musicResponsiveListItemRenderer": {}}],
+            }
+        }]}}}
+        api = YTMusic(language="en")
+        with patch.object(api, "_send_request", return_value=response), \
+             patch("ytmusicapi.mixins.search.parse_search_results", return_value=[{"videoId": "abc"}]), \
+             patch("ytmusicapi.mixins.search.get_continuations", return_value=[]):
+            self.assertEqual(api.search("test", filter="songs"), [])
+            response["contents"]["sectionListRenderer"]["contents"][0]["musicShelfRenderer"]["title"]["runs"][0]["text"] = "Songs"
+            self.assertEqual(api.search("test", filter="songs"), [{"videoId": "abc"}])
 
     def test_artist_tracks_and_lyrics(self):
         self.assertEqual(self.call("artist", "UC123")[0]["title"], "Artist — Song")
