@@ -1,7 +1,10 @@
 mod backend;
 mod cover;
+mod spectrum;
 
-use backend::{Action, Auth, Event, State, Track};
+#[cfg(test)]
+use backend::Track;
+use backend::{Action, Auth, Event, SearchEntry, State};
 use crossterm::{
     event::{self, Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
@@ -37,7 +40,8 @@ struct App {
     events: Sender<Event>,
     input: String,
     focus: Focus,
-    results: Vec<Track>,
+    results: Vec<SearchEntry>,
+    result_limit: usize,
     selected: usize,
     queue_selected: usize,
     button: usize,
@@ -51,6 +55,7 @@ struct App {
     cover_id: u64,
     cover: Option<image::RgbImage>,
     cover_status: String,
+    levels: [f32; spectrum::BANDS],
 }
 impl App {
     fn new(auth: Auth, actions: Sender<Action>, events: Sender<Event>) -> Self {
@@ -61,11 +66,12 @@ impl App {
             input: String::new(),
             focus: Focus::Search,
             results: vec![],
+            result_limit: 10,
             selected: 0,
             queue_selected: 0,
             button: 0,
             state: State::default(),
-            message: "Введите запрос или ссылку и нажмите Enter".into(),
+            message: String::new(),
             search_id: 0,
             searching: false,
             queue_open: false,
@@ -74,6 +80,7 @@ impl App {
             cover_id: 0,
             cover: None,
             cover_status: "Выберите трек".into(),
+            levels: [0.0; spectrum::BANDS],
         }
     }
     fn send(&self, action: Action) {
@@ -85,14 +92,18 @@ impl App {
             self.message = "Введите запрос или ссылку".into();
             return;
         }
+        self.search_query(query);
+    }
+    fn search_query(&mut self, query: String) {
         self.search_id = self.search_id.wrapping_add(1);
         let id = self.search_id;
         self.searching = true;
         self.message = "Ищем…".into();
         let auth = self.auth.clone();
         let events = self.events.clone();
+        let limit = self.result_limit;
         thread::spawn(move || {
-            let result = backend::lookup(&query, &auth);
+            let result = backend::lookup(&query, &auth, limit);
             let _ = events.send(Event::Search(id, result));
         });
     }
@@ -137,10 +148,7 @@ impl App {
                         } else if self.results.is_empty() {
                             "Ничего не найдено".into()
                         } else {
-                            format!(
-                                "Найдено: {}. Enter — слушать, A — в очередь",
-                                self.results.len()
-                            )
+                            format!("Найдено: {}", self.results.len())
                         };
                         if !self.results.is_empty() {
                             self.focus = Focus::Results;
@@ -161,6 +169,7 @@ impl App {
                 Err(e) => self.cover_status = e,
             },
             Event::Cover(_, _) => {}
+            Event::Spectrum(levels) => self.levels = levels,
         }
     }
     fn toggle_queue(&mut self) {
@@ -243,15 +252,23 @@ impl App {
             KeyCode::Char('+') | KeyCode::Char('=') => self.send(Action::Volume(10)),
             KeyCode::Char('-') => self.send(Action::Volume(-10)),
             KeyCode::Char('a') if self.focus == Focus::Results => {
-                if let Some(track) = self.results.get(self.selected) {
+                if let Some(SearchEntry::Track(track)) = self.results.get(self.selected) {
                     self.send(Action::Add(vec![track.clone()]));
                     self.message = format!("Добавлено: {}", track.title);
                 }
             }
             KeyCode::Char('A') if self.focus == Focus::Results => {
-                if !self.results.is_empty() {
-                    self.send(Action::Add(self.results.clone()));
-                    self.message = format!("Добавлено в очередь: {}", self.results.len());
+                let tracks: Vec<_> = self
+                    .results
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        SearchEntry::Track(track) => Some(track.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                if !tracks.is_empty() {
+                    self.message = format!("Добавлено в очередь: {}", tracks.len());
+                    self.send(Action::Add(tracks));
                 }
             }
             KeyCode::Up => match self.focus {
@@ -280,11 +297,11 @@ impl App {
                 self.button = (self.button + 1).min(5)
             }
             KeyCode::Enter => match self.focus {
-                Focus::Results => {
-                    if let Some(track) = self.results.get(self.selected) {
-                        self.send(Action::Play(track.clone()));
-                    }
-                }
+                Focus::Results => match self.results.get(self.selected).cloned() {
+                    Some(SearchEntry::Track(track)) => self.send(Action::Play(track)),
+                    Some(SearchEntry::Artist { url, .. }) => self.search_query(url),
+                    None => {}
+                },
                 Focus::Controls => self.activate_button(),
                 _ => {}
             },
@@ -318,30 +335,16 @@ fn draw(frame: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Length(3),
             Constraint::Min(4),
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(2),
+            Constraint::Length(4),
         ])
         .split(area);
-    let header = Line::from(vec![
-        Span::styled(
-            "  CLI MUSIC  ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("   музыка в терминале", Style::default().fg(Color::Gray)),
-    ]);
-    frame.render_widget(Paragraph::new(header).block(panel("", false)), rows[0]);
     let search = if app.input.is_empty() {
         "Введите название, исполнителя или ссылку…"
     } else {
         &app.input
     };
-    let visible_width = rows[1].width.saturating_sub(2) as usize;
+    let visible_width = rows[0].width.saturating_sub(2) as usize;
     let input_width = UnicodeWidthStr::width(app.input.as_str());
     let scroll = input_width.saturating_sub(visible_width.saturating_sub(1));
     frame.render_widget(
@@ -360,28 +363,56 @@ fn draw(frame: &mut Frame, app: &App) {
                 },
                 app.focus == Focus::Search,
             )),
-        rows[1],
+        rows[0],
     );
     if app.focus == Focus::Search && visible_width > 0 {
-        frame.set_cursor_position((rows[1].x + 1 + (input_width - scroll) as u16, rows[1].y + 1));
+        frame.set_cursor_position((rows[0].x + 1 + (input_width - scroll) as u16, rows[0].y + 1));
     }
 
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(rows[2]);
+        .split(rows[1]);
     let highlight = Style::default()
         .bg(Color::DarkGray)
         .fg(Color::White)
         .add_modifier(Modifier::BOLD);
-    let results: Vec<ListItem> = app
+    let artists = app
         .results
         .iter()
-        .map(|t| ListItem::new(t.title.as_str()))
-        .collect();
+        .filter(|e| matches!(e, SearchEntry::Artist { .. }))
+        .count();
+    let tracks = app.results.len() - artists;
+    let mut results = Vec::new();
+    if artists > 0 {
+        results.push(
+            ListItem::new(" ИСПОЛНИТЕЛИ").style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        );
+    }
+    for entry in app.results.iter().take(artists) {
+        results.push(ListItem::new(entry.title()));
+    }
+    if tracks > 0 {
+        results.push(
+            ListItem::new(" ТРЕКИ").style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        );
+    }
+    for entry in app.results.iter().skip(artists) {
+        results.push(ListItem::new(entry.title()));
+    }
     let mut rs = ListState::default();
-    if !results.is_empty() {
-        rs.select(Some(app.selected));
+    if !app.results.is_empty() {
+        let header_count =
+            usize::from(artists > 0) + usize::from(tracks > 0 && app.selected >= artists);
+        rs.select(Some(app.selected + header_count));
     }
     frame.render_stateful_widget(
         List::new(results)
@@ -394,7 +425,13 @@ fn draw(frame: &mut Frame, app: &App) {
         columns[0],
         &mut rs,
     );
-    draw_cover(frame, columns[1], app);
+    let art_height = columns[1].height.saturating_sub(5).clamp(3, 13);
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(art_height), Constraint::Min(3)])
+        .split(columns[1]);
+    draw_cover(frame, right[0], app);
+    draw_spectrum(frame, right[1], app);
     let status = if app.state.loading {
         "Загрузка"
     } else if app.state.paused {
@@ -410,15 +447,24 @@ fn draw(frame: &mut Frame, app: &App) {
         .as_ref()
         .map(|t| t.title.as_str())
         .unwrap_or("Выберите трек");
-    frame.render_widget(
-        Paragraph::new(format!(
-            " {status}  ·  {title}  ·  Громкость {}%",
-            app.state.volume
-        ))
-        .block(panel(" Сейчас ", false)),
-        rows[3],
+    let player_block = panel(" Сейчас ", app.focus == Focus::Controls);
+    let inside = player_block.inner(rows[2]);
+    frame.render_widget(player_block, rows[2]);
+    let player_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .split(inside);
+    let status_line = format!(
+        " {status} · {title} · Громкость {}%{}",
+        app.state.volume,
+        if app.message.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", app.message.replace(['\n', '\r'], " "))
+        }
     );
-    let labels = if rows[4].width < 75 {
+    frame.render_widget(Paragraph::new(status_line), player_rows[0]);
+    let labels = if rows[2].width < 75 {
         [
             "|◀",
             if app.state.paused { "▶" } else { "Ⅱ" },
@@ -451,11 +497,7 @@ fn draw(frame: &mut Frame, app: &App) {
             Constraint::Percentage(14),
             Constraint::Percentage(15),
         ])
-        .split(panel("", false).inner(rows[4]));
-    frame.render_widget(
-        panel(" Управление · ← → Enter ", app.focus == Focus::Controls),
-        rows[4],
-    );
+        .split(player_rows[1]);
     for (i, label) in labels.iter().enumerate() {
         let style = if app.focus == Focus::Controls && app.button == i {
             Style::default()
@@ -472,16 +514,6 @@ fn draw(frame: &mut Frame, app: &App) {
             buttons[i],
         );
     }
-    let footer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1)])
-        .split(rows[5]);
-    frame.render_widget(
-        Paragraph::new(app.message.replace(['\n', '\r'], " "))
-            .style(Style::default().fg(Color::Gray)),
-        footer[0],
-    );
-    frame.render_widget(Paragraph::new("Tab: очередь  /: поиск  ↑↓: выбор  Enter: играть  a: добавить  Space: пауза  P/N: назад/далее  Q: выход").style(Style::default().fg(Color::Gray)), footer[1]);
     if app.queue_open {
         let popup = centered(area, 75, 70);
         frame.render_widget(Clear, popup);
@@ -552,7 +584,11 @@ fn draw_cover(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-    let image = image::imageops::thumbnail(image, inner.width as u32, inner.height as u32 * 2);
+    let side = inner.width.min(inner.height.saturating_mul(2)).min(22) as u32;
+    if side == 0 {
+        return;
+    }
+    let image = image::imageops::thumbnail(image, side, side);
     let x = inner.x + (inner.width - image.width() as u16) / 2;
     let rows = (image.height() as u16).div_ceil(2);
     let y = inner.y + (inner.height - rows) / 2;
@@ -576,6 +612,51 @@ fn draw_cover(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             Paragraph::new(Line::from(spans)),
             ratatui::layout::Rect::new(x, y + row, image.width() as u16, 1),
         );
+    }
+}
+
+fn draw_spectrum(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+    let block = panel(" Частоты ", false);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width < 8 || inner.height == 0 {
+        return;
+    }
+    let has_labels = inner.height >= 3 && inner.width >= 24;
+    let height = inner.height.saturating_sub(u16::from(has_labels));
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Ratio(1, 8); spectrum::BANDS])
+        .split(inner);
+    let labels = ["63", "125", "250", "500", "1k", "2k", "4k", "8k"];
+    for (index, column) in columns.iter().enumerate() {
+        let bar_height = (app.levels[index] * f32::from(height)).round() as u16;
+        for row in 0..height {
+            let character = if height - row <= bar_height {
+                "█"
+            } else {
+                "·"
+            };
+            let bar = ratatui::layout::Rect::new(column.x, inner.y + row, column.width, 1);
+            frame.render_widget(
+                Paragraph::new(character)
+                    .alignment(ratatui::layout::Alignment::Center)
+                    .style(Style::default().fg(if character == "█" {
+                        Color::Cyan
+                    } else {
+                        Color::DarkGray
+                    })),
+                bar,
+            );
+        }
+        if has_labels {
+            frame.render_widget(
+                Paragraph::new(labels[index])
+                    .alignment(ratatui::layout::Alignment::Center)
+                    .style(Style::default().fg(Color::Gray)),
+                ratatui::layout::Rect::new(column.x, inner.y + height, column.width, 1),
+            );
+        }
     }
 }
 
@@ -607,6 +688,8 @@ fn run(auth: Auth) -> io::Result<()> {
             while let Ok(event) = event_rx.try_recv() {
                 app.handle_event(event);
             }
+            app.result_limit =
+                usize::from(terminal.size()?.height.saturating_sub(11)).clamp(1, 100);
             terminal.draw(|frame| draw(frame, &app))?;
             if event::poll(Duration::from_millis(100))? {
                 if let TermEvent::Key(key) = event::read()? {
@@ -672,14 +755,14 @@ mod tests {
     fn arrows_select_track_and_enter_plays_it() {
         let (mut app, rx) = make_app();
         app.results = vec![
-            Track {
+            SearchEntry::Track(Track {
                 title: "one".into(),
                 url: "one".into(),
-            },
-            Track {
+            }),
+            SearchEntry::Track(Track {
                 title: "two".into(),
                 url: "two".into(),
-            },
+            }),
         ];
         app.key(press(KeyCode::Down));
         app.key(press(KeyCode::Down));
@@ -715,10 +798,10 @@ mod tests {
     #[test]
     fn arrows_reach_controls_from_search_without_queue() {
         let (mut app, _) = make_app();
-        app.results = vec![Track {
+        app.results = vec![SearchEntry::Track(Track {
             title: "one".into(),
             url: "one".into(),
-        }];
+        })];
         app.key(press(KeyCode::Down));
         assert!(app.focus == Focus::Results);
         app.key(press(KeyCode::Down));
@@ -741,23 +824,23 @@ mod tests {
         app.handle_event(Event::Search(
             2,
             Ok((
-                vec![Track {
+                vec![SearchEntry::Track(Track {
                     title: "new".into(),
                     url: "url".into(),
-                }],
+                })],
                 String::new(),
             )),
         ));
         app.handle_event(Event::Search(
             1,
             Ok((
-                vec![Track {
+                vec![SearchEntry::Track(Track {
                     title: "old".into(),
                     url: "url".into(),
-                }],
+                })],
                 String::new(),
             )),
         ));
-        assert_eq!(app.results[0].title, "new");
+        assert_eq!(app.results[0].title(), "new");
     }
 }

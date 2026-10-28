@@ -29,41 +29,92 @@ impl Auth {
     }
 }
 
-fn parse_tracks(output: &str) -> Vec<Track> {
-    output
-        .lines()
-        .filter_map(|line| {
-            let (id, title) = line.split_once('\t')?;
-            if id.is_empty() || title.is_empty() {
-                return None;
-            }
-            let url = if id.starts_with("https://") || id.starts_with("http://") {
-                id.to_owned()
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SearchEntry {
+    Artist { title: String, url: String },
+    Track(Track),
+}
+impl SearchEntry {
+    pub fn title(&self) -> &str {
+        match self {
+            Self::Artist { title, .. } => title,
+            Self::Track(track) => &track.title,
+        }
+    }
+}
+fn parse_results(output: &str) -> Vec<SearchEntry> {
+    let mut artists = Vec::new();
+    let mut tracks = Vec::new();
+    for line in output.lines() {
+        let fields: Vec<_> = line.splitn(4, '\t').collect();
+        if fields.len() != 4 {
+            continue;
+        }
+        let (kind, id, title, entry_url) = (fields[0], fields[1], fields[2], fields[3]);
+        if id.is_empty() || title.is_empty() || id == "NA" || title == "NA" {
+            continue;
+        }
+        let is_artist = kind == "YoutubeTab"
+            && (entry_url.contains("/channel/")
+                || entry_url.contains("/@")
+                || entry_url.contains("/user/")
+                || id.starts_with("UC"));
+        if is_artist {
+            let base = if entry_url.starts_with("https://") {
+                entry_url
+                    .split('?')
+                    .next()
+                    .unwrap_or(entry_url)
+                    .trim_end_matches('/')
+                    .to_owned()
+            } else {
+                format!("https://www.youtube.com/channel/{id}")
+            };
+            let url = if base.ends_with("/videos") {
+                base
+            } else {
+                format!("{base}/videos")
+            };
+            artists.push(SearchEntry::Artist {
+                title: title.to_owned(),
+                url,
+            });
+        } else if kind != "YoutubeTab" {
+            let url = if entry_url.starts_with("https://") {
+                entry_url.to_owned()
             } else {
                 format!("https://www.youtube.com/watch?v={id}")
             };
-            Some(Track {
+            tracks.push(SearchEntry::Track(Track {
                 title: title.to_owned(),
                 url,
-            })
-        })
-        .collect()
+            }));
+        }
+    }
+    artists.extend(tracks);
+    artists
 }
-
-pub fn lookup(query: &str, auth: &Auth) -> Result<(Vec<Track>, String), String> {
+pub fn lookup(
+    query: &str,
+    auth: &Auth,
+    limit: usize,
+) -> Result<(Vec<SearchEntry>, String), String> {
     let mut cmd = Command::new("yt-dlp");
     auth.apply(&mut cmd);
+    let limit = limit.clamp(1, 100);
     let target = if query.starts_with("https://") || query.starts_with("http://") {
         query.to_owned()
     } else {
-        format!("ytsearch10:{query}")
+        format!("ytsearch{limit}:{query}")
     };
     let output = cmd
         .args([
             "--ignore-config",
             "--flat-playlist",
+            "--playlist-end",
+            &limit.to_string(),
             "--print",
-            "%(id)s\t%(title)s",
+            "%(ie_key)s\t%(id)s\t%(title)s\t%(url)s",
             "--",
             &target,
         ])
@@ -77,7 +128,7 @@ pub fn lookup(query: &str, auth: &Auth) -> Result<(Vec<Track>, String), String> 
     }
     let warnings = String::from_utf8_lossy(&output.stderr);
     Ok((
-        parse_tracks(&String::from_utf8_lossy(&output.stdout)),
+        parse_results(&String::from_utf8_lossy(&output.stdout)),
         warnings.trim().to_owned(),
     ))
 }
@@ -121,10 +172,17 @@ struct Player {
     endpoint: String,
     #[cfg(unix)]
     directory: std::path::PathBuf,
+    spectrum: Option<crate::spectrum::Spectrum>,
+    stream_url: String,
 }
 
 impl Player {
-    fn start(url: &str, volume: i32, events: Sender<Event>) -> io::Result<Self> {
+    fn start(
+        url: &str,
+        volume: i32,
+        events: Sender<Event>,
+        enable_spectrum: bool,
+    ) -> io::Result<Self> {
         let id = NEXT_PLAYER.fetch_add(1, Ordering::Relaxed);
         let name = format!("cli-music-{}-{id}", std::process::id());
         #[cfg(unix)]
@@ -136,7 +194,23 @@ impl Player {
         };
         #[cfg(windows)]
         let endpoint = format!(r"\\.\pipe\{name}");
-        let child = Command::new("mpv")
+        let spectrum = if enable_spectrum {
+            crate::spectrum::Spectrum::new()
+                .ok()
+                .filter(|s| s.graph().is_some())
+        } else {
+            None
+        };
+        if enable_spectrum && spectrum.is_none() {
+            let _ = events.send(Event::Message(
+                "Анализатор частот недоступен на этой системе".into(),
+            ));
+        }
+        let mut command = Command::new("mpv");
+        if let Some(graph) = spectrum.as_ref().and_then(|s| s.graph()) {
+            command.arg(format!("--af=lavfi=[{graph}]"));
+        }
+        let child = command
             .args([
                 "--no-video",
                 "--input-terminal=no",
@@ -163,6 +237,8 @@ impl Player {
                     endpoint,
                     #[cfg(unix)]
                     directory,
+                    spectrum,
+                    stream_url: url.to_owned(),
                 })
             }
             Err(e) => {
@@ -233,8 +309,9 @@ pub enum Action {
 pub enum Event {
     State(State),
     Message(String),
-    Search(u64, Result<(Vec<Track>, String), String>),
+    Search(u64, Result<(Vec<SearchEntry>, String), String>),
     Cover(u64, Result<image::RgbImage, String>),
+    Spectrum([f32; crate::spectrum::BANDS]),
 }
 enum Resolved {
     Ready(u64, Track, Result<String, String>),
@@ -249,6 +326,7 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, auth: Auth) {
     let mut history = Vec::<Track>::new();
     let mut player: Option<Player> = None;
     let mut generation = 0u64;
+    let mut last_spectrum = std::time::Instant::now();
     let (rtx, rrx) = mpsc::channel();
     let publish = |state: &mut State, queue: &VecDeque<Track>| {
         state.queue = queue.iter().cloned().collect();
@@ -259,6 +337,23 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, auth: Auth) {
         if let Some(active) = player.as_mut() {
             match active.child.try_wait() {
                 Ok(Some(status)) => {
+                    if !status.success() && active.spectrum.is_some() {
+                        let url = active.stream_url.clone();
+                        let _ = events.send(Event::Spectrum([0.0; crate::spectrum::BANDS]));
+                        let _ = events.send(Event::Message(
+                            "Анализатор недоступен; повторяем без него".into(),
+                        ));
+                        match Player::start(&url, state.volume, events.clone(), false) {
+                            Ok(active) => {
+                                player = Some(active);
+                                continue;
+                            }
+                            Err(e) => {
+                                let _ = events
+                                    .send(Event::Message(format!("Не удалось запустить mpv: {e}")));
+                            }
+                        }
+                    }
                     if !status.success() {
                         let _ = events.send(Event::Message(format!(
                             "mpv завершился с ошибкой: {status}"
@@ -285,13 +380,26 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, auth: Auth) {
                 _ => {}
             }
         }
+        if last_spectrum.elapsed() >= Duration::from_millis(200) {
+            let levels = if state.paused {
+                [0.0; crate::spectrum::BANDS]
+            } else {
+                player
+                    .as_ref()
+                    .and_then(|p| p.spectrum.as_ref())
+                    .map(|s| s.levels())
+                    .unwrap_or([0.0; crate::spectrum::BANDS])
+            };
+            let _ = events.send(Event::Spectrum(levels));
+            last_spectrum = std::time::Instant::now();
+        }
         while let Ok(Resolved::Ready(id, track, result)) = rrx.try_recv() {
             if id != generation {
                 continue;
             }
             state.loading = false;
             match result {
-                Ok(url) => match Player::start(&url, state.volume, events.clone()) {
+                Ok(url) => match Player::start(&url, state.volume, events.clone(), true) {
                     Ok(active) => {
                         player = Some(active);
                         state.current = Some(track);
@@ -412,11 +520,13 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, auth: Auth) {
 mod tests {
     use super::*;
     #[test]
-    fn parses_search_results_and_preserves_titles() {
-        let tracks = parse_tracks("abc123\tArtist — Song\ninvalid\nhttps://example.org/v\tOther\n");
-        assert_eq!(tracks.len(), 2);
-        assert_eq!(tracks[0].url, "https://www.youtube.com/watch?v=abc123");
-        assert_eq!(tracks[0].title, "Artist — Song");
-        assert_eq!(tracks[1].url, "https://example.org/v");
+    fn groups_channels_before_tracks_and_preserves_urls() {
+        let results = parse_results("Youtube\tabc123\tArtist — Song\tabc123\nYoutubeTab\tUC123\tArtist\thttps://www.youtube.com/channel/UC123\n");
+        assert!(
+            matches!(&results[0], SearchEntry::Artist { title, url } if title == "Artist" && url.ends_with("UC123/videos"))
+        );
+        assert!(
+            matches!(&results[1], SearchEntry::Track(track) if track.url == "https://www.youtube.com/watch?v=abc123")
+        );
     }
 }
