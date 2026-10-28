@@ -1,6 +1,7 @@
 """Small, isolated adapter for the public YouTube Music catalogue."""
 import json
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     import requests
@@ -27,15 +28,23 @@ def main():
     mode, value = sys.argv[1:3]
     # Filtered search in ytmusicapi 1.12.x matches English shelf names
     # ("Songs", "Artists"). Russian shelf labels are silently discarded.
-    api = YTMusic(requests_session=TimedSession(), language="en")
     if mode == "search":
         limit = max(1, int(sys.argv[3]))
-        artists = api.search(value, filter="artists", limit=20)
-        songs = api.search(value, filter="songs", limit=limit)
+        # Keep the two network requests independent; requests.Session is not
+        # shared between threads.
+        def search_kind(kind, count):
+            client = YTMusic(requests_session=TimedSession(), language="en")
+            return client.search(value, filter=kind, limit=count)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            artists_future = pool.submit(search_kind, "artists", 20)
+            songs_future = pool.submit(search_kind, "songs", limit)
+            artists = artists_future.result()
+            songs = songs_future.result()
         result = [{"type": "artist", "title": a.get("artist") or a.get("name") or "Исполнитель",
                    "url": "musicartist:" + a["browseId"]} for a in artists if a.get("browseId")]
         result.extend([x for x in (song(s) for s in songs) if x][:limit])
         return result
+    api = YTMusic(requests_session=TimedSession(), language="en")
     if mode == "artist":
         limit = max(1, int(sys.argv[3]))
         songs = api.get_artist(value).get("songs") or {}

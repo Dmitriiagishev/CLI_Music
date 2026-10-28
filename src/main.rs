@@ -3,7 +3,6 @@ mod cover;
 mod music;
 mod spectrum;
 
-#[cfg(test)]
 use backend::Track;
 use backend::{Action, Auth, Event, SearchEntry, State};
 use crossterm::{
@@ -38,6 +37,12 @@ enum Focus {
     Queue,
     Controls,
 }
+struct ContextMenu {
+    track: Track,
+    choice: usize,
+    x: u16,
+    y: u16,
+}
 struct App {
     auth: Auth,
     actions: Sender<Action>,
@@ -49,6 +54,8 @@ struct App {
     query: String,
     has_more: bool,
     loading_more: bool,
+    queue_generation: u64,
+    context: Option<ContextMenu>,
     selected: usize,
     queue_selected: usize,
     button: usize,
@@ -84,6 +91,8 @@ impl App {
             query: String::new(),
             has_more: false,
             loading_more: false,
+            queue_generation: 0,
+            context: None,
             selected: 0,
             queue_selected: 0,
             button: 0,
@@ -237,6 +246,30 @@ impl App {
                 self.loading_more = false;
             }
             Event::Search(_, _) => {}
+            Event::QueueTail(id, initial, result) if id == self.queue_generation => match result {
+                Ok(entries) => {
+                    let tracks: Vec<_> = entries
+                        .into_iter()
+                        .filter_map(|entry| match entry {
+                            SearchEntry::Track(track) => Some(track),
+                            _ => None,
+                        })
+                        .collect();
+                    if tracks.starts_with(&initial) {
+                        let tail = tracks[initial.len()..].to_vec();
+                        if !tail.is_empty() {
+                            self.send(Action::Add(tail));
+                        }
+                    } else {
+                        self.message =
+                            "Список изменился: остальные треки не добавлены автоматически".into();
+                    }
+                }
+                Err(error) => {
+                    self.message = format!("Не удалось загрузить остаток очереди: {error}")
+                }
+            },
+            Event::QueueTail(_, _, _) => {}
             Event::Cover(id, result) if id == self.cover_id => match result {
                 Ok(image) => {
                     self.cover = Some(image);
@@ -269,6 +302,57 @@ impl App {
             _ => self.send(Action::Next),
         }
     }
+    fn play_from(&mut self, track: &Track) {
+        let Some(index) = self
+            .results
+            .get(self.selected)
+            .filter(|entry| matches!(entry, SearchEntry::Track(item) if item == track))
+            .map(|_| self.selected)
+            .or_else(|| {
+                self.results
+                    .iter()
+                    .position(|entry| matches!(entry, SearchEntry::Track(item) if item == track))
+            })
+        else {
+            return;
+        };
+        let tracks = self.results[index..]
+            .iter()
+            .filter_map(|entry| match entry {
+                SearchEntry::Track(track) => Some(track.clone()),
+                _ => None,
+            })
+            .collect();
+        self.queue_generation = self.queue_generation.wrapping_add(1);
+        if self.has_more {
+            let initial = self
+                .results
+                .iter()
+                .filter_map(|entry| match entry {
+                    SearchEntry::Track(track) => Some(track.clone()),
+                    _ => None,
+                })
+                .collect();
+            let query = self.query.clone();
+            let auth = self.auth.clone();
+            let events = self.events.clone();
+            let id = self.queue_generation;
+            thread::spawn(move || {
+                let result = backend::lookup(&query, &auth, usize::MAX).map(|(entries, _)| entries);
+                let _ = events.send(Event::QueueTail(id, initial, result));
+            });
+        }
+        self.send(Action::PlayList(tracks));
+    }
+    fn context_action(&mut self) {
+        if let Some(menu) = self.context.take() {
+            match menu.choice {
+                0 => self.play_from(&menu.track),
+                1 => self.send(Action::PlayNext(menu.track)),
+                _ => self.send(Action::Add(vec![menu.track])),
+            }
+        }
+    }
     fn mouse(&mut self, mouse: MouseEvent, area: Rect) {
         if area.width < 45 || area.height < 18 {
             return;
@@ -284,6 +368,20 @@ impl App {
             MouseEventKind::ScrollDown => 1,
             _ => 0,
         };
+        if let Some(menu) = self.context.as_mut() {
+            let rect = context_rect(area, menu.x, menu.y);
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                && contains(rect)
+                && mouse.row > rect.y
+                && mouse.row < rect.bottom() - 1
+            {
+                menu.choice = usize::from(mouse.row - rect.y - 1).min(2);
+                self.context_action();
+            } else if mouse.kind == MouseEventKind::Down(MouseButton::Left) && !contains(rect) {
+                self.context = None;
+            }
+            return;
+        }
         if self.details_open {
             if scroll < 0 {
                 self.details_scroll = self.details_scroll.saturating_sub(3);
@@ -388,7 +486,17 @@ impl App {
             {
                 self.selected = index;
                 self.focus = Focus::Results;
-                self.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                match self.results[index].clone() {
+                    SearchEntry::Track(track) => {
+                        self.context = Some(ContextMenu {
+                            track,
+                            choice: 0,
+                            x: mouse.column,
+                            y: mouse.row,
+                        })
+                    }
+                    SearchEntry::Artist { url, .. } => self.search_query(url),
+                }
             }
         } else {
             let player = panel("", false).inner(left[2]);
@@ -452,6 +560,16 @@ impl App {
     fn key(&mut self, key: KeyEvent) -> bool {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return false;
+        }
+        if let Some(menu) = self.context.as_mut() {
+            match key.code {
+                KeyCode::Esc => self.context = None,
+                KeyCode::Up => menu.choice = menu.choice.saturating_sub(1),
+                KeyCode::Down => menu.choice = (menu.choice + 1).min(2),
+                KeyCode::Enter => self.context_action(),
+                _ => {}
+            }
+            return true;
         }
         if self.details_open {
             match key.code {
@@ -545,7 +663,10 @@ impl App {
                 self.details_scroll = 0;
                 self.details_open = true;
             }
-            KeyCode::Char('s') => self.send(Action::Stop),
+            KeyCode::Char('s') => {
+                self.queue_generation = self.queue_generation.wrapping_add(1);
+                self.send(Action::Stop);
+            }
             KeyCode::Char(' ') if self.focus != Focus::Controls => self.send(Action::Toggle),
             KeyCode::Char('n') => self.send(Action::Next),
             KeyCode::Char('p') => self.send(Action::Previous),
@@ -600,7 +721,7 @@ impl App {
             }
             KeyCode::Enter => match self.focus {
                 Focus::Results => match self.results.get(self.selected).cloned() {
-                    Some(SearchEntry::Track(track)) => self.send(Action::Play(track)),
+                    Some(SearchEntry::Track(track)) => self.play_from(&track),
                     Some(SearchEntry::Artist { url, .. }) => self.search_query(url),
                     None => {}
                 },
@@ -633,7 +754,7 @@ fn result_row(index: usize, artists: usize, total: usize) -> usize {
 fn main_layout(area: Rect) -> (std::rc::Rc<[Rect]>, std::rc::Rc<[Rect]>) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(area);
     let left = Layout::default()
         .direction(Direction::Vertical)
@@ -691,6 +812,7 @@ fn draw(frame: &mut Frame, app: &App) {
         && !app.auth_open
         && !app.lyrics_open
         && !app.details_open
+        && app.context.is_none()
     {
         frame.set_cursor_position((left[0].x + 1 + (input_width - scroll) as u16, left[0].y + 1));
     }
@@ -776,6 +898,7 @@ fn draw(frame: &mut Frame, app: &App) {
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Min(0),
         ])
         .split(inside);
@@ -812,10 +935,40 @@ fn draw(frame: &mut Frame, app: &App) {
             buttons[i],
         );
     }
+    let format_time = |value: Option<f64>| match value {
+        Some(value) if value.is_finite() && value >= 0.0 => {
+            let seconds = value as u64;
+            format!("{}:{:02}", seconds / 60, seconds % 60)
+        }
+        _ => "--:--".into(),
+    };
+    let elapsed = format_time(app.state.position);
+    let duration = format_time(app.state.duration);
+    let available =
+        usize::from(player_rows[3].width).saturating_sub(elapsed.len() + duration.len() + 2);
+    let count = available.min(30);
+    let ratio = match (app.state.position, app.state.duration) {
+        (Some(position), Some(duration)) if duration > 0.0 => (position / duration).clamp(0.0, 1.0),
+        _ => 0.0,
+    };
+    let filled = (ratio * count as f64).round() as usize;
+    let progress = Line::from(vec![
+        Span::raw(format!("{elapsed} ")),
+        Span::styled("▰".repeat(filled), Style::default().fg(Color::Cyan)),
+        Span::styled(
+            "▱".repeat(count.saturating_sub(filled)),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::raw(format!(" {duration}")),
+    ]);
+    frame.render_widget(
+        Paragraph::new(progress).alignment(ratatui::layout::Alignment::Center),
+        player_rows[3],
+    );
     frame.render_widget(
         Paragraph::new(app.message.replace(['\n', '\r'], " "))
             .style(Style::default().fg(Color::Gray)),
-        player_rows[3],
+        player_rows[4],
     );
     draw_spectrum(frame, right[1], app);
     if app.queue_open {
@@ -889,6 +1042,37 @@ fn draw(frame: &mut Frame, app: &App) {
             popup,
         );
     }
+    if let Some(menu) = &app.context {
+        let rect = context_rect(area, menu.x, menu.y);
+        frame.render_widget(Clear, rect);
+        let options = ["Играть", "Играть следующим", "Добавить в очередь"];
+        let mut state = ListState::default();
+        state.select(Some(menu.choice));
+        frame.render_stateful_widget(
+            List::new(
+                options
+                    .iter()
+                    .map(|item| ListItem::new(*item))
+                    .collect::<Vec<_>>(),
+            )
+            .block(panel("", true))
+            .highlight_style(highlight)
+            .highlight_symbol("▸ "),
+            rect,
+            &mut state,
+        );
+    }
+}
+
+fn context_rect(area: Rect, x: u16, y: u16) -> Rect {
+    let width = area.width.min(24);
+    let height = area.height.min(5);
+    Rect::new(
+        x.min(area.right().saturating_sub(width)).max(area.x),
+        y.min(area.bottom().saturating_sub(height)).max(area.y),
+        width,
+        height,
+    )
 }
 
 fn centered(area: ratatui::layout::Rect, width: u16, height: u16) -> ratatui::layout::Rect {
@@ -988,8 +1172,8 @@ fn draw_spectrum(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         return;
     }
     let bands = spectrum::BANDS as u16;
-    let gap = u16::from(inner.width >= bands * 2 - 1);
-    let bar_width = (inner.width - gap * (bands - 1)) / bands;
+    let bar_width = (inner.width / (bands * 3)).max(1);
+    let gap = (inner.width - bar_width * bands) / (bands - 1);
     let used = bar_width * bands + gap * (bands - 1);
     let start = inner.x + (inner.width - used) / 2;
     let height = inner.height.min(12);
@@ -1180,7 +1364,7 @@ mod tests {
         app.key(press(KeyCode::Down));
         app.key(press(KeyCode::Enter));
         match rx.try_recv().unwrap() {
-            Action::Play(track) => assert_eq!(track.title, "two"),
+            Action::PlayList(tracks) => assert_eq!(tracks[0].title, "two"),
             _ => panic!("expected playback"),
         }
     }
@@ -1231,7 +1415,7 @@ mod tests {
 
     #[test]
     fn spectrum_uses_theme_color_then_orange_and_burgundy() {
-        assert_eq!(spectrum::BANDS, 12);
+        assert_eq!(spectrum::BANDS, 20);
         assert_eq!(spectrum_color(0.5), Color::Reset);
         assert_eq!(spectrum_color(0.65), Color::Rgb(216, 139, 72));
         assert_eq!(spectrum_color(0.9), Color::Rgb(121, 44, 67));
@@ -1251,7 +1435,7 @@ mod tests {
                 .map(|x| buffer.cell((x, y)).unwrap().symbol())
                 .collect();
             let bars: Vec<_> = row.split_whitespace().collect();
-            assert_eq!(bars.len(), 12);
+            assert_eq!(bars.len(), 20);
             assert!(bars
                 .iter()
                 .all(|bar| bar.chars().count() == bars[0].chars().count()));
@@ -1307,9 +1491,73 @@ mod tests {
             },
             area,
         );
+        assert!(rx.try_recv().is_err());
+        assert!(matches!(&app.context, Some(menu) if menu.track.url == format!("track{index}")));
+        app.key(press(KeyCode::Enter));
         assert!(
-            matches!(rx.try_recv(), Ok(Action::Play(track)) if track.url == format!("track{index}"))
+            matches!(rx.try_recv(), Ok(Action::PlayList(tracks)) if tracks[0].url == format!("track{index}") && tracks.len() == 60-index)
         );
+    }
+    #[test]
+    fn menu_actions_keep_track_order_and_auto_queue_later_results() {
+        let (mut app, rx) = make_app();
+        let track = |id: &str| Track {
+            title: id.into(),
+            url: id.into(),
+        };
+        app.results = vec![
+            SearchEntry::Track(track("one")),
+            SearchEntry::Track(track("two")),
+        ];
+        app.query = "query".into();
+        app.has_more = false;
+        app.context = Some(ContextMenu {
+            track: track("one"),
+            choice: 0,
+            x: 0,
+            y: 0,
+        });
+        app.context_action();
+        assert!(
+            matches!(rx.try_recv(), Ok(Action::PlayList(tracks)) if tracks == vec![track("one"), track("two")])
+        );
+        app.handle_event(Event::QueueTail(
+            app.queue_generation,
+            vec![track("one"), track("two")],
+            Ok(vec![
+                SearchEntry::Track(track("one")),
+                SearchEntry::Track(track("two")),
+                SearchEntry::Track(track("three")),
+            ]),
+        ));
+        assert!(matches!(rx.try_recv(), Ok(Action::Add(tracks)) if tracks == vec![track("three")]));
+        app.queue_generation += 1;
+        app.handle_event(Event::QueueTail(
+            app.queue_generation - 1,
+            vec![track("one"), track("two")],
+            Ok(vec![
+                SearchEntry::Track(track("one")),
+                SearchEntry::Track(track("two")),
+                SearchEntry::Track(track("stale")),
+            ]),
+        ));
+        assert!(rx.try_recv().is_err());
+        app.context = Some(ContextMenu {
+            track: track("two"),
+            choice: 1,
+            x: 0,
+            y: 0,
+        });
+        app.context_action();
+        assert!(matches!(rx.try_recv(), Ok(Action::PlayNext(item)) if item == track("two")));
+        app.context = Some(ContextMenu {
+            track: track("one"),
+            choice: 2,
+            x: 0,
+            y: 0,
+        });
+        app.context_action();
+        assert!(matches!(rx.try_recv(), Ok(Action::Add(items)) if items == vec![track("one")]));
     }
     #[test]
     fn loading_more_preserves_selection_and_focus() {

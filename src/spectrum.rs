@@ -3,9 +3,10 @@ use std::{
     io::{Read, Seek, SeekFrom},
     path::PathBuf,
 };
-pub const BANDS: usize = 12;
+pub const BANDS: usize = 20;
 const FREQUENCIES: [u32; BANDS] = [
-    63, 100, 160, 250, 400, 630, 1000, 1600, 2500, 4000, 6300, 10000,
+    50, 70, 100, 140, 200, 280, 400, 560, 800, 1100, 1500, 2100, 2900, 4000, 5500, 7500, 10000,
+    12000, 14000, 16000,
 ];
 pub struct Spectrum {
     _directory: tempfile::TempDir,

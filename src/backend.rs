@@ -14,7 +14,7 @@ pub struct Track {
     pub url: String,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Auth {
     pub browser: Option<String>,
     pub cookies: Option<String>,
@@ -146,6 +146,68 @@ enum AudioMode {
     Pipe,
     HlsPipe,
 }
+// yt-dlp resolves the next stream in parallel. The pipe buffers its beginning
+// and applies backpressure, so the whole track is not downloaded to disk.
+struct Preload {
+    url: String,
+    auth: Auth,
+    child: Option<Child>,
+    stdout: Option<std::process::ChildStdout>,
+    logs: Arc<Mutex<VecDeque<String>>>,
+    reader: Option<thread::JoinHandle<()>>,
+}
+impl Preload {
+    fn start(url: &str, auth: &Auth) -> io::Result<Self> {
+        let mut cmd = Command::new("yt-dlp");
+        auth.apply(&mut cmd);
+        cmd.args([
+            "--no-playlist",
+            "--no-progress",
+            "--extractor-args",
+            "youtube:player_client=tv_samsung",
+            "--http-chunk-size",
+            "64K",
+            "-f",
+            "bestaudio/best",
+            "-o",
+            "-",
+            "--",
+            url,
+        ]);
+        let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+        let logs = Arc::new(Mutex::new(VecDeque::new()));
+        let reader = child
+            .stderr
+            .take()
+            .map(|stderr| collect_output(stderr, logs.clone()));
+        let stdout = child.stdout.take();
+        Ok(Self {
+            url: url.into(),
+            auth: auth.clone(),
+            child: Some(child),
+            stdout,
+            logs,
+            reader,
+        })
+    }
+    fn failed(&mut self) -> bool {
+        self.child
+            .as_mut()
+            .and_then(|p| p.try_wait().ok().flatten())
+            .is_some_and(|status| !status.success())
+    }
+}
+impl Drop for Preload {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
 struct Player {
     child: Child,
     downloader: Option<Child>,
@@ -170,6 +232,7 @@ impl Player {
         enable_spectrum: bool,
         mode: AudioMode,
         initial_error: Option<String>,
+        prepared: Option<Preload>,
     ) -> io::Result<Self> {
         let id = NEXT_PLAYER.fetch_add(1, Ordering::Relaxed);
         let name = format!("cli-music-{}-{id}", std::process::id());
@@ -194,12 +257,27 @@ impl Player {
                 "Анализатор частот недоступен на этой системе".into(),
             ));
         }
-        let logs = Arc::new(Mutex::new(VecDeque::new()));
+        let logs = prepared
+            .as_ref()
+            .map(|p| p.logs.clone())
+            .unwrap_or_else(|| Arc::new(Mutex::new(VecDeque::new())));
         let mut readers = Vec::new();
         let mut downloader = None;
         let mut media_input = Stdio::null();
         let mut command = Command::new("mpv");
-        if mode != AudioMode::Default {
+        if let Some(mut ready) = prepared {
+            media_input = Stdio::from(
+                ready
+                    .stdout
+                    .take()
+                    .ok_or_else(|| io::Error::other("Поток предзагрузки недоступен"))?,
+            );
+            downloader = ready.child.take();
+            if let Some(reader) = ready.reader.take() {
+                readers.push(reader);
+            }
+            command.arg("--ytdl=no");
+        } else if mode != AudioMode::Default {
             let mut extract = Command::new("yt-dlp");
             auth.apply(&mut extract);
             extract.args(["--no-playlist", "--no-progress"]);
@@ -360,6 +438,36 @@ impl Player {
     fn playback_started(&self) -> bool {
         true
     }
+    #[cfg(unix)]
+    fn timing(&self) -> (Option<f64>, Option<f64>) {
+        let Ok(mut socket) = std::os::unix::net::UnixStream::connect(&self.endpoint) else {
+            return (None, None);
+        };
+        let _ = socket.set_read_timeout(Some(Duration::from_millis(40)));
+        if socket.write_all(b"{\"command\":[\"get_property\",\"time-pos\"],\"request_id\":1}\n{\"command\":[\"get_property\",\"duration\"],\"request_id\":2}\n").is_err() { return (None, None); }
+        let mut reader = BufReader::new(socket);
+        let mut values = [None, None];
+        for _ in 0..2 {
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_err() {
+                break;
+            }
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                if value["error"] == "success" {
+                    if let Some(id @ 1..=2) = value["request_id"].as_u64() {
+                        values[(id - 1) as usize] = value["data"]
+                            .as_f64()
+                            .filter(|n| n.is_finite() && *n >= 0.0);
+                    }
+                }
+            }
+        }
+        (values[0], values[1])
+    }
+    #[cfg(windows)]
+    fn timing(&self) -> (Option<f64>, Option<f64>) {
+        (None, None)
+    }
 
     fn command(&self, command: &str) -> Result<(), String> {
         // mpv creates the endpoint asynchronously after startup.
@@ -471,10 +579,13 @@ pub struct State {
     pub loading: bool,
     pub volume: i32,
     pub can_previous: bool,
+    pub position: Option<f64>,
+    pub duration: Option<f64>,
 }
 pub enum Action {
     Add(Vec<Track>),
-    Play(Track),
+    PlayList(Vec<Track>),
+    PlayNext(Track),
     Remove(usize),
     Toggle,
     Next,
@@ -488,6 +599,7 @@ pub enum Event {
     State(State),
     Message(String),
     Search(u64, Result<(Vec<SearchEntry>, String), String>),
+    QueueTail(u64, Vec<Track>, Result<Vec<SearchEntry>, String>),
     Cover(u64, Result<image::RgbImage, String>),
     Spectrum([f32; crate::spectrum::BANDS]),
     Lyrics(u64, Result<String, String>),
@@ -501,7 +613,9 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
     let mut queue = VecDeque::new();
     let mut history = Vec::<Track>::new();
     let mut player: Option<Player> = None;
+    let mut preload: Option<Preload> = None;
     let mut last_spectrum = std::time::Instant::now();
+    let mut last_progress = std::time::Instant::now();
     let publish = |state: &mut State, queue: &VecDeque<Track>| {
         state.queue = queue.iter().cloned().collect();
         let _ = events.send(Event::State(state.clone()));
@@ -526,6 +640,7 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
                             false,
                             active.mode,
                             active.initial_error.clone(),
+                            None,
                         ) {
                             Ok(replacement) => {
                                 state.loading = true;
@@ -576,6 +691,7 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
                             active.spectrum.is_some(),
                             next,
                             Some(previous),
+                            None,
                         ) {
                             Ok(replacement) => {
                                 state.loading = true;
@@ -615,6 +731,8 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
                     state.can_previous = !history.is_empty();
                     player = None;
                     state.current = None;
+                    state.position = None;
+                    state.duration = None;
                     state.paused = false;
                     state.loading = false;
                     publish(&mut state, &queue);
@@ -647,12 +765,28 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
             let _ = events.send(Event::Spectrum(levels));
             last_spectrum = std::time::Instant::now();
         }
+        if last_progress.elapsed() >= Duration::from_millis(500) {
+            if let Some(active) = &player {
+                let (position, duration) = active.timing();
+                state.position = position;
+                state.duration = duration;
+                publish(&mut state, &queue);
+            }
+            last_progress = std::time::Instant::now();
+        }
         if player.is_none() && !state.loading {
             if let Some(track) = queue.pop_front() {
                 let _ = events.send(Event::Message(String::new()));
                 state.current = Some(track.clone());
                 state.paused = false;
                 state.loading = true;
+                state.position = None;
+                state.duration = None;
+                let prepared = preload
+                    .take()
+                    .filter(|p| p.url == track.url && p.auth == auth)
+                    .filter(|p| p.stdout.is_some());
+                let prepared = prepared.and_then(|mut p| if p.failed() { None } else { Some(p) });
                 match Player::start(
                     &track.url,
                     &auth,
@@ -665,6 +799,7 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
                         AudioMode::Default
                     },
                     None,
+                    prepared,
                 ) {
                     Ok(active) => player = Some(active),
                     Err(e) => {
@@ -677,9 +812,31 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
                 publish(&mut state, &queue);
             }
         }
+        if player.is_some() {
+            let next = queue
+                .front()
+                .filter(|track| authenticated_music(&track.url, &auth));
+            if preload
+                .as_ref()
+                .is_some_and(|p| next.is_none_or(|t| p.url != t.url || p.auth != auth))
+            {
+                preload = None;
+            }
+            if preload.is_none() {
+                if let Some(track) = next {
+                    preload = Preload::start(&track.url, &auth).ok();
+                }
+            }
+        } else if queue.is_empty() {
+            preload = None;
+        }
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(Action::Add(tracks)) => queue.extend(tracks),
-            Ok(Action::Play(track)) => {
+            Ok(Action::PlayNext(track)) => queue.push_front(track),
+            Ok(Action::PlayList(tracks)) => {
+                if tracks.is_empty() {
+                    continue;
+                }
                 if player.is_some() && !state.loading {
                     if let Some(current) = state.current.take() {
                         history.push(current);
@@ -687,11 +844,11 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
                 }
                 state.can_previous = !history.is_empty();
                 player = None;
+                preload = None;
                 state.loading = false;
                 state.current = None;
                 state.paused = false;
-                queue.clear();
-                queue.push_back(track);
+                queue = tracks.into();
             }
             Ok(Action::Remove(index)) => {
                 queue.remove(index);
@@ -716,6 +873,8 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
                 player = None;
                 state.loading = false;
                 state.current = None;
+                state.position = None;
+                state.duration = None;
                 state.paused = false;
             }
             Ok(Action::Previous) => {
@@ -736,8 +895,11 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
                 history.clear();
                 state.can_previous = false;
                 player = None;
+                preload = None;
                 state.loading = false;
                 state.current = None;
+                state.position = None;
+                state.duration = None;
                 state.paused = false;
                 queue.clear();
             }
@@ -749,7 +911,10 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
                     }
                 }
             }
-            Ok(Action::SetAuth(updated)) => auth = updated,
+            Ok(Action::SetAuth(updated)) => {
+                preload = None;
+                auth = updated;
+            }
             Ok(Action::Quit) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
         }
