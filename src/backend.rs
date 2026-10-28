@@ -4,6 +4,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -136,38 +137,6 @@ pub fn lookup(
     ))
 }
 
-fn resolve(track: &Track, auth: &Auth) -> Result<String, String> {
-    let mut cmd = Command::new("yt-dlp");
-    auth.apply(&mut cmd);
-    let out = cmd
-        .args([
-            "--ignore-config",
-            "--no-playlist",
-            "--no-warnings",
-            "-f",
-            "bestaudio/best",
-            "-g",
-            "--",
-            &track.url,
-        ])
-        .output()
-        .map_err(|e| format!("Не удалось запустить yt-dlp: {e}"))?;
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_owned());
-    }
-    let url = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_owned();
-    if url.is_empty() {
-        Err("yt-dlp не вернул аудиопоток".into())
-    } else {
-        Ok(url)
-    }
-}
-
 static NEXT_PLAYER: AtomicU64 = AtomicU64::new(0);
 
 struct Player {
@@ -176,12 +145,16 @@ struct Player {
     #[cfg(unix)]
     directory: std::path::PathBuf,
     spectrum: Option<crate::spectrum::Spectrum>,
-    stream_url: String,
+    track_url: String,
+    auth: Auth,
+    logs: Arc<Mutex<VecDeque<String>>>,
+    readers: Vec<thread::JoinHandle<()>>,
 }
 
 impl Player {
     fn start(
         url: &str,
+        auth: &Auth,
         volume: i32,
         events: Sender<Event>,
         enable_spectrum: bool,
@@ -210,6 +183,19 @@ impl Player {
             ));
         }
         let mut command = Command::new("mpv");
+        command.args([
+            "--ytdl=yes",
+            "--script-opts=ytdl_hook-ytdl_path=yt-dlp",
+            "--ytdl-format=bestaudio/best",
+        ]);
+        if let Some(browser) = &auth.browser {
+            command.arg(format!(
+                "--ytdl-raw-options-append=cookies-from-browser={browser}"
+            ));
+        }
+        if let Some(path) = &auth.cookies {
+            command.arg(format!("--ytdl-raw-options-append=cookies={path}"));
+        }
         if let Some(graph) = spectrum.as_ref().and_then(|s| s.graph()) {
             command.arg(format!("--af=lavfi=[{graph}]"));
         }
@@ -229,11 +215,13 @@ impl Player {
             .spawn();
         match child {
             Ok(mut child) => {
+                let logs = Arc::new(Mutex::new(VecDeque::new()));
+                let mut readers = Vec::new();
                 if let Some(stream) = child.stdout.take() {
-                    forward_output(stream, events.clone());
+                    readers.push(collect_output(stream, logs.clone()));
                 }
                 if let Some(stream) = child.stderr.take() {
-                    forward_output(stream, events.clone());
+                    readers.push(collect_output(stream, logs.clone()));
                 }
                 Ok(Self {
                     child,
@@ -241,7 +229,10 @@ impl Player {
                     #[cfg(unix)]
                     directory,
                     spectrum,
-                    stream_url: url.to_owned(),
+                    track_url: url.to_owned(),
+                    auth: auth.clone(),
+                    logs,
+                    readers,
                 })
             }
             Err(e) => {
@@ -250,6 +241,39 @@ impl Player {
                 Err(e)
             }
         }
+    }
+
+    fn finish_logs(&mut self) -> String {
+        for reader in self.readers.drain(..) {
+            let _ = reader.join();
+        }
+        self.logs
+            .lock()
+            .map(|lines| lines.iter().cloned().collect::<Vec<_>>().join("\n"))
+            .unwrap_or_default()
+    }
+
+    #[cfg(unix)]
+    fn playback_started(&self) -> bool {
+        let Ok(mut socket) = std::os::unix::net::UnixStream::connect(&self.endpoint) else {
+            return false;
+        };
+        let _ = socket.set_read_timeout(Some(Duration::from_millis(50)));
+        if socket
+            .write_all(b"{\"command\":[\"get_property\",\"time-pos\"]}\n")
+            .is_err()
+        {
+            return false;
+        }
+        let mut response = String::new();
+        BufReader::new(socket).read_line(&mut response).ok();
+        serde_json::from_str::<serde_json::Value>(&response)
+            .ok()
+            .is_some_and(|value| value["error"] == "success" && value["data"].is_number())
+    }
+    #[cfg(windows)]
+    fn playback_started(&self) -> bool {
+        true
     }
 
     fn command(&self, command: &str) -> Result<(), String> {
@@ -279,14 +303,49 @@ impl Drop for Player {
         }
     }
 }
-fn forward_output(stream: impl Read + Send + 'static, events: Sender<Event>) {
+fn sanitize_log(line: &str) -> String {
+    let lowercase = line.to_ascii_lowercase();
+    if lowercase.contains("cookie:") || lowercase.contains("authorization:") {
+        return "[скрыты конфиденциальные заголовки]".into();
+    }
+    line.split_whitespace()
+        .map(|word| {
+            if word.contains("https://") || word.contains("http://") {
+                "[ссылка скрыта]"
+            } else {
+                word
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(500)
+        .collect()
+}
+fn collect_output(
+    stream: impl Read + Send + 'static,
+    logs: Arc<Mutex<VecDeque<String>>>,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         for line in BufReader::new(stream).lines().map_while(Result::ok) {
-            if !line.trim().is_empty() {
-                let _ = events.send(Event::Message(line));
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(mut lines) = logs.lock() {
+                if lines.len() >= 25 {
+                    lines.pop_front();
+                }
+                lines.push_back(sanitize_log(&line));
             }
         }
-    });
+    })
+}
+fn filter_failed(logs: &str) -> bool {
+    logs.lines().any(|line| {
+        let line = line.to_ascii_lowercase();
+        line.contains("lavfi")
+            || (line.contains("filter") && (line.contains("fail") || line.contains("error")))
+    })
 }
 
 #[derive(Clone, Default)]
@@ -318,9 +377,6 @@ pub enum Event {
     Spectrum([f32; crate::spectrum::BANDS]),
     Lyrics(u64, Result<String, String>),
 }
-enum Resolved {
-    Ready(u64, Track, Result<String, String>),
-}
 
 pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) {
     let mut state = State {
@@ -330,9 +386,7 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
     let mut queue = VecDeque::new();
     let mut history = Vec::<Track>::new();
     let mut player: Option<Player> = None;
-    let mut generation = 0u64;
     let mut last_spectrum = std::time::Instant::now();
-    let (rtx, rrx) = mpsc::channel();
     let publish = |state: &mut State, queue: &VecDeque<Track>| {
         state.queue = queue.iter().cloned().collect();
         let _ = events.send(Event::State(state.clone()));
@@ -342,27 +396,35 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
         if let Some(active) = player.as_mut() {
             match active.child.try_wait() {
                 Ok(Some(status)) => {
-                    if !status.success() && active.spectrum.is_some() {
-                        let url = active.stream_url.clone();
+                    let logs = active.finish_logs();
+                    if !status.success() && active.spectrum.is_some() && filter_failed(&logs) {
+                        let url = active.track_url.clone();
+                        let player_auth = active.auth.clone();
                         let _ = events.send(Event::Spectrum([0.0; crate::spectrum::BANDS]));
                         let _ = events.send(Event::Message(
                             "Анализатор недоступен; повторяем без него".into(),
                         ));
-                        match Player::start(&url, state.volume, events.clone(), false) {
-                            Ok(active) => {
-                                player = Some(active);
+                        match Player::start(&url, &player_auth, state.volume, events.clone(), false)
+                        {
+                            Ok(replacement) => {
+                                state.loading = true;
+                                publish(&mut state, &queue);
+                                player = Some(replacement);
                                 continue;
                             }
                             Err(e) => {
-                                let _ = events
-                                    .send(Event::Message(format!("Не удалось запустить mpv: {e}")));
+                                let _ = events.send(Event::Message(format!(
+                                    "Не удалось запустить mpv: {e}\n{logs}"
+                                )));
                             }
                         }
-                    }
-                    if !status.success() {
-                        let _ = events.send(Event::Message(format!(
-                            "mpv завершился с ошибкой: {status}"
-                        )));
+                    } else if !status.success() {
+                        let message = if logs.is_empty() {
+                            format!("mpv завершился с ошибкой: {status}")
+                        } else {
+                            format!("mpv: {status}\n{logs}")
+                        };
+                        let _ = events.send(Event::Message(message));
                     }
                     if status.success() {
                         if let Some(track) = state.current.take() {
@@ -373,6 +435,7 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
                     player = None;
                     state.current = None;
                     state.paused = false;
+                    state.loading = false;
                     publish(&mut state, &queue);
                 }
                 Err(e) => {
@@ -386,6 +449,10 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
             }
         }
         if last_spectrum.elapsed() >= Duration::from_millis(200) {
+            if state.loading && player.as_ref().is_some_and(|p| p.playback_started()) {
+                state.loading = false;
+                publish(&mut state, &queue);
+            }
             let levels = if state.paused {
                 [0.0; crate::spectrum::BANDS]
             } else {
@@ -398,56 +465,33 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
             let _ = events.send(Event::Spectrum(levels));
             last_spectrum = std::time::Instant::now();
         }
-        while let Ok(Resolved::Ready(id, track, result)) = rrx.try_recv() {
-            if id != generation {
-                continue;
-            }
-            state.loading = false;
-            match result {
-                Ok(url) => match Player::start(&url, state.volume, events.clone(), true) {
-                    Ok(active) => {
-                        player = Some(active);
-                        state.current = Some(track);
-                    }
+        if player.is_none() && !state.loading {
+            if let Some(track) = queue.pop_front() {
+                let _ = events.send(Event::Message(String::new()));
+                state.current = Some(track.clone());
+                state.paused = false;
+                state.loading = true;
+                match Player::start(&track.url, &auth, state.volume, events.clone(), true) {
+                    Ok(active) => player = Some(active),
                     Err(e) => {
                         state.current = None;
+                        state.loading = false;
                         let _ =
                             events.send(Event::Message(format!("Не удалось запустить mpv: {e}")));
                     }
-                },
-                Err(e) => {
-                    state.current = None;
-                    let _ = events.send(Event::Message(format!("Не удалось получить поток: {e}")));
                 }
-            }
-            publish(&mut state, &queue);
-        }
-        if player.is_none() && !state.loading {
-            if let Some(track) = queue.pop_front() {
-                generation = generation.wrapping_add(1);
-                let id = generation;
-                state.current = Some(track.clone());
-                state.loading = true;
-                state.paused = false;
                 publish(&mut state, &queue);
-                let tx = rtx.clone();
-                let auth = auth.clone();
-                thread::spawn(move || {
-                    let result = resolve(&track, &auth);
-                    let _ = tx.send(Resolved::Ready(id, track, result));
-                });
             }
         }
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(Action::Add(tracks)) => queue.extend(tracks),
             Ok(Action::Play(track)) => {
-                if player.is_some() {
+                if player.is_some() && !state.loading {
                     if let Some(current) = state.current.take() {
                         history.push(current);
                     }
                 }
                 state.can_previous = !history.is_empty();
-                generation = generation.wrapping_add(1);
                 player = None;
                 state.loading = false;
                 state.current = None;
@@ -469,13 +513,12 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
                 }
             }
             Ok(Action::Next) => {
-                if player.is_some() {
+                if player.is_some() && !state.loading {
                     if let Some(current) = state.current.take() {
                         history.push(current);
                     }
                 }
                 state.can_previous = !history.is_empty();
-                generation = generation.wrapping_add(1);
                 player = None;
                 state.loading = false;
                 state.current = None;
@@ -487,7 +530,6 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
                         queue.push_front(current);
                     }
                     queue.push_front(previous);
-                    generation = generation.wrapping_add(1);
                     player = None;
                     state.loading = false;
                     state.paused = false;
@@ -499,7 +541,6 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
             Ok(Action::Stop) => {
                 history.clear();
                 state.can_previous = false;
-                generation = generation.wrapping_add(1);
                 player = None;
                 state.loading = false;
                 state.current = None;
@@ -525,6 +566,22 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn diagnostics_hide_sensitive_headers_and_stream_urls() {
+        assert!(sanitize_log("Cookie: secret").contains("скрыты"));
+        assert!(sanitize_log("Authorization: Bearer secret").contains("скрыты"));
+        let output = sanitize_log("HTTP 403 https://example.org/stream?token=secret");
+        assert!(output.contains("HTTP 403"));
+        assert!(!output.contains("secret"));
+    }
+
+    #[test]
+    fn retries_only_on_audio_filter_errors() {
+        assert!(filter_failed("Failed to configure filter graph"));
+        assert!(!filter_failed("Sign in to confirm you’re not a bot"));
+        assert!(!filter_failed("HTTP 403 Forbidden"));
+    }
+
     #[test]
     fn groups_channels_before_tracks_and_preserves_urls() {
         let results = parse_results("Youtube\tabc123\tArtist — Song\tabc123\nYoutubeTab\tUC123\tArtist\thttps://www.youtube.com/channel/UC123\n");
