@@ -33,12 +33,13 @@ impl Auth {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SearchEntry {
     Artist { title: String, url: String },
+    Album { title: String, url: String },
     Track(Track),
 }
 impl SearchEntry {
     pub fn title(&self) -> &str {
         match self {
-            Self::Artist { title, .. } => title,
+            Self::Artist { title, .. } | Self::Album { title, .. } => title,
             Self::Track(track) => &track.title,
         }
     }
@@ -446,15 +447,16 @@ impl Player {
         true
     }
     #[cfg(unix)]
-    fn timing(&self) -> (Option<f64>, Option<f64>) {
+    fn timing(&self) -> (Option<f64>, Option<f64>, Vec<(f64, f64)>) {
         let Ok(mut socket) = std::os::unix::net::UnixStream::connect(&self.endpoint) else {
-            return (None, None);
+            return (None, None, Vec::new());
         };
         let _ = socket.set_read_timeout(Some(Duration::from_millis(40)));
-        if socket.write_all(b"{\"command\":[\"get_property\",\"time-pos\"],\"request_id\":1}\n{\"command\":[\"get_property\",\"duration\"],\"request_id\":2}\n").is_err() { return (None, None); }
+        if socket.write_all(b"{\"command\":[\"get_property\",\"time-pos\"],\"request_id\":1}\n{\"command\":[\"get_property\",\"duration\"],\"request_id\":2}\n{\"command\":[\"get_property\",\"demuxer-cache-state\"],\"request_id\":3}\n").is_err() { return (None, None, Vec::new()); }
         let mut reader = BufReader::new(socket);
         let mut values = [None, None];
-        for _ in 0..2 {
+        let mut buffered = Vec::new();
+        for _ in 0..3 {
             let mut line = String::new();
             if reader.read_line(&mut line).is_err() {
                 break;
@@ -466,14 +468,17 @@ impl Player {
                             .as_f64()
                             .filter(|n| n.is_finite() && *n >= 0.0);
                     }
+                    if value["request_id"] == 3 {
+                        buffered = cached_ranges(&value["data"]);
+                    }
                 }
             }
         }
-        (values[0], values[1])
+        (values[0], values[1], buffered)
     }
     #[cfg(windows)]
-    fn timing(&self) -> (Option<f64>, Option<f64>) {
-        (None, None)
+    fn timing(&self) -> (Option<f64>, Option<f64>, Vec<(f64, f64)>) {
+        (None, None, Vec::new())
     }
 
     #[cfg(unix)]
@@ -535,6 +540,19 @@ impl Player {
         }
         Err("Не удалось подключиться к управлению mpv.".into())
     }
+}
+fn cached_ranges(cache: &serde_json::Value) -> Vec<(f64, f64)> {
+    cache["seekable-ranges"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|range| {
+            let start = range["start"].as_f64()?;
+            let end = range["end"].as_f64()?;
+            (start.is_finite() && end.is_finite() && end >= 0.0 && end >= start)
+                .then_some((start.max(0.0), end))
+        })
+        .collect()
 }
 impl Drop for Player {
     fn drop(&mut self) {
@@ -632,6 +650,7 @@ pub struct State {
     pub can_previous: bool,
     pub position: Option<f64>,
     pub duration: Option<f64>,
+    pub buffered: Vec<(f64, f64)>,
 }
 pub enum Action {
     Add(Vec<Track>),
@@ -788,6 +807,7 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
                     state.current = None;
                     state.position = None;
                     state.duration = None;
+                    state.buffered.clear();
                     state.paused = false;
                     state.loading = false;
                     publish(&mut state, &queue);
@@ -796,6 +816,9 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
                     let _ = events.send(Event::Message(format!("Ошибка mpv: {e}")));
                     player = None;
                     state.current = None;
+                    state.position = None;
+                    state.duration = None;
+                    state.buffered.clear();
                     state.paused = false;
                     publish(&mut state, &queue);
                 }
@@ -840,9 +863,10 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
                         }
                     }
                 }
-                let (position, duration) = active.timing();
+                let (position, duration, buffered) = active.timing();
                 state.position = position;
                 state.duration = duration;
+                state.buffered = buffered;
                 publish(&mut state, &queue);
             }
             last_progress = std::time::Instant::now();
@@ -856,6 +880,7 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
                 pending_seek = None;
                 state.position = None;
                 state.duration = None;
+                state.buffered.clear();
                 let prepared = preload
                     .take()
                     .filter(|p| p.url == track.url && p.auth == auth)
@@ -941,6 +966,9 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
                 pending_seek = None;
                 state.loading = false;
                 state.current = None;
+                state.position = None;
+                state.duration = None;
+                state.buffered.clear();
                 state.paused = false;
                 queue = tracks.into();
             }
@@ -970,6 +998,7 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
                 state.current = None;
                 state.position = None;
                 state.duration = None;
+                state.buffered.clear();
                 state.paused = false;
             }
             Ok(Action::Previous) => {
@@ -981,6 +1010,9 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
                     player = None;
                     pending_seek = None;
                     state.loading = false;
+                    state.position = None;
+                    state.duration = None;
+                    state.buffered.clear();
                     state.paused = false;
                     state.can_previous = !history.is_empty();
                 } else {
@@ -997,6 +1029,7 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
                 state.current = None;
                 state.position = None;
                 state.duration = None;
+                state.buffered.clear();
                 state.paused = false;
                 queue.clear();
             }
@@ -1029,6 +1062,18 @@ mod tests {
         let output = sanitize_log("HTTP 403 https://example.org/stream?token=secret");
         assert!(output.contains("HTTP 403"));
         assert!(!output.contains("secret"));
+    }
+    #[test]
+    fn buffered_ranges_only_report_valid_cached_intervals() {
+        let cache = serde_json::json!({"seekable-ranges": [
+            {"start": 0.0, "end": 24.5}, {"start": 30.0, "end": 50.0},
+            {"start": -1.0, "end": 10.0}, {"start": 8.0, "end": 2.0}, {"start": null, "end": 9.0}
+        ]});
+        assert_eq!(
+            cached_ranges(&cache),
+            vec![(0.0, 24.5), (30.0, 50.0), (0.0, 10.0)]
+        );
+        assert!(cached_ranges(&serde_json::Value::Null).is_empty());
     }
 
     #[test]

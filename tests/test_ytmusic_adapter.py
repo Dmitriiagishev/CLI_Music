@@ -19,6 +19,8 @@ class FakeMusic:
     def search(self, query, filter, limit):
         if filter == "artists":
             return [{"artist": "Artist", "browseId": "UC123"}]
+        if filter == "albums":
+            return [{"title": "Album", "browseId": "MPRE123", "artists": [{"name": "Artist"}]}]
         if query == "many":
             return [{"title": f"Song {i}", "videoId": f"id{i}"} for i in range(min(limit, 150))]
         return [{"title": "Song", "videoId": "abc", "artists": [{"name": "Artist"}]}]
@@ -30,6 +32,10 @@ class FakeMusic:
         if value != "PL123":
             raise AssertionError("Artist playlist ID must omit VL prefix")
         return {"tracks": [{"title": "Song" if i == 0 else f"Song {i}", "videoId": "abc" if i == 0 else f"id{i}", "artists": [{"name": "Artist"}]} for i in range(min(limit, 150))]}
+
+    def get_album(self, value):
+        assert value == "MPRE123"
+        return {"artists": [{"name": "Artist"}], "tracks": [{"title": "Track one", "videoId": "t1"}, {"title": "Track two", "videoId": "t2"}]}
 
     def get_watch_playlist(self, **kwargs):
         self.watch_calls.append(kwargs)
@@ -58,11 +64,12 @@ class AdapterTests(unittest.TestCase):
 
     def test_search_groups_music_artists_and_songs(self):
         result = self.call("search", "Artist song")
-        self.assertEqual([entry["type"] for entry in result], ["artist", "track"])
+        self.assertEqual([entry["type"] for entry in result], ["artist", "album", "track"])
         self.assertEqual(result[0]["url"], "musicartist:UC123")
-        self.assertEqual(result[1]["url"], "https://music.youtube.com/watch?v=abc")
+        self.assertEqual(result[1]["url"], "musicalbum:MPRE123")
+        self.assertEqual(result[2]["url"], "https://music.youtube.com/watch?v=abc")
         many = self.call("search", "many", "120")
-        self.assertEqual(len(many), 121)
+        self.assertEqual(len(many), 122)
         self.assertEqual(many[-1]["title"], "Song 119")
 
     def test_library_drops_russian_filtered_shelves(self):
@@ -87,6 +94,8 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(len(tracks), 120)
         self.assertEqual(tracks[-1]["title"], "Artist — Song 119")
         self.assertEqual(self.call("lyrics", "abc"), "First line\nSecond line")
+        album = self.call("album", "MPRE123")
+        self.assertEqual([item["title"] for item in album], ["Artist — Track one", "Artist — Track two"])
 
     def test_details_and_radio_return_songs_without_seed_or_duplicates(self):
         details = self.call("details", "abc")

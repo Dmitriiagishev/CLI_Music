@@ -28,7 +28,7 @@ use std::{
     thread,
     time::Duration,
 };
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -49,6 +49,7 @@ struct App {
     actions: Sender<Action>,
     events: Sender<Event>,
     input: String,
+    input_cursor: usize,
     focus: Focus,
     results: Vec<SearchEntry>,
     result_limit: usize,
@@ -90,6 +91,7 @@ impl App {
             actions,
             events,
             input: String::new(),
+            input_cursor: 0,
             focus: Focus::Search,
             results: vec![],
             result_limit: 50,
@@ -596,17 +598,27 @@ impl App {
             }
         } else if contains(left[0]) {
             self.focus = Focus::Search;
+            let visible = usize::from(left[0].width.saturating_sub(2));
+            let cursor_width = UnicodeWidthStr::width(&self.input[..self.input_cursor]);
+            let scroll = cursor_width.saturating_sub(visible.saturating_sub(1));
+            let column = usize::from(mouse.column.saturating_sub(left[0].x + 1)) + scroll;
+            self.input_cursor = input_index_at_column(&self.input, column);
         } else if contains(results) {
             let artists = self
                 .results
                 .iter()
                 .filter(|e| matches!(e, SearchEntry::Artist { .. }))
                 .count();
-            let selected_row = result_row(self.selected, artists, self.results.len());
+            let albums = self
+                .results
+                .iter()
+                .filter(|e| matches!(e, SearchEntry::Album { .. }))
+                .count();
+            let selected_row = result_row(self.selected, artists, albums, self.results.len());
             let row =
                 list_offset(selected_row, results.height) + usize::from(mouse.row - results.y);
-            if let Some(index) =
-                (0..self.results.len()).find(|&i| result_row(i, artists, self.results.len()) == row)
+            if let Some(index) = (0..self.results.len())
+                .find(|&i| result_row(i, artists, albums, self.results.len()) == row)
             {
                 self.selected = index;
                 self.focus = Focus::Results;
@@ -619,7 +631,9 @@ impl App {
                             y: mouse.row,
                         })
                     }
-                    SearchEntry::Artist { url, .. } => self.search_query(url),
+                    SearchEntry::Artist { url, .. } | SearchEntry::Album { url, .. } => {
+                        self.search_query(url)
+                    }
                 }
             }
         } else {
@@ -699,7 +713,7 @@ impl App {
     }
     fn key(&mut self, key: KeyEvent) -> bool {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            return false;
+            return true;
         }
         if let Some(menu) = self.context.as_mut() {
             match key.code {
@@ -774,14 +788,40 @@ impl App {
                 KeyCode::Esc => self.focus = Focus::Results,
                 KeyCode::Enter => self.search(),
                 KeyCode::Backspace => {
-                    self.input.pop();
+                    if let Some((index, _)) =
+                        self.input[..self.input_cursor].char_indices().next_back()
+                    {
+                        self.input.drain(index..self.input_cursor);
+                        self.input_cursor = index;
+                    }
                 }
+                KeyCode::Delete => {
+                    if let Some(ch) = self.input[self.input_cursor..].chars().next() {
+                        self.input
+                            .drain(self.input_cursor..self.input_cursor + ch.len_utf8());
+                    }
+                }
+                KeyCode::Left => {
+                    self.input_cursor = self.input[..self.input_cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                }
+                KeyCode::Right => {
+                    if let Some(ch) = self.input[self.input_cursor..].chars().next() {
+                        self.input_cursor += ch.len_utf8();
+                    }
+                }
+                KeyCode::Home => self.input_cursor = 0,
+                KeyCode::End => self.input_cursor = self.input.len(),
                 KeyCode::Char(c)
                     if !key
                         .modifiers
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
-                    self.input.push(c)
+                    self.input.insert(self.input_cursor, c);
+                    self.input_cursor += c.len_utf8();
                 }
                 KeyCode::Down => {
                     self.focus = if self.results.is_empty() {
@@ -795,7 +835,8 @@ impl App {
             return true;
         }
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return false,
+            KeyCode::Char('q') => return false,
+            KeyCode::Esc => self.focus = Focus::Search,
             KeyCode::Char('/') => self.focus = Focus::Search,
             KeyCode::Char('g') => self.auth_open = true,
             KeyCode::Char('r') => self.start_radio(),
@@ -873,7 +914,9 @@ impl App {
             KeyCode::Enter => match self.focus {
                 Focus::Results => match self.results.get(self.selected).cloned() {
                     Some(SearchEntry::Track(track)) => self.play_from(&track),
-                    Some(SearchEntry::Artist { url, .. }) => self.search_query(url),
+                    Some(SearchEntry::Artist { url, .. } | SearchEntry::Album { url, .. }) => {
+                        self.search_query(url)
+                    }
                     None => {}
                 },
                 Focus::Controls => self.activate_button(),
@@ -904,8 +947,42 @@ fn panel(title: &str, selected: bool) -> Block<'_> {
 fn list_offset(selected: usize, height: u16) -> usize {
     selected.saturating_sub(usize::from(height.saturating_sub(1)))
 }
-fn result_row(index: usize, artists: usize, total: usize) -> usize {
-    index + usize::from(artists > 0) + usize::from(total > artists && index >= artists)
+fn result_row(index: usize, artists: usize, albums: usize, total: usize) -> usize {
+    index
+        + usize::from(artists > 0)
+        + usize::from(albums > 0 && index >= artists)
+        + usize::from(total > artists + albums && index >= artists + albums)
+}
+fn input_index_at_column(input: &str, column: usize) -> usize {
+    let mut offset = 0;
+    for (index, ch) in input.char_indices() {
+        let width = ch.width().unwrap_or(0);
+        if width > 0 && column < offset + width {
+            return index;
+        }
+        offset += width;
+    }
+    input.len()
+}
+fn truncate_label(text: &str, width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut result = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let w = ch.width().unwrap_or(0);
+        if used + w > width - 1 {
+            break;
+        }
+        result.push(ch);
+        used += w;
+    }
+    result.push('…');
+    result
 }
 fn format_time(value: Option<f64>) -> String {
     match value {
@@ -941,21 +1018,27 @@ fn details_layout(area: Rect) -> DetailsLayout {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(inner);
-    let image_height = cols[0].height.saturating_sub(5).min(11);
+    let left = Rect::new(
+        cols[0].x,
+        cols[0].y,
+        cols[0].width.saturating_sub(1),
+        cols[0].height,
+    );
+    let image_height = left.height.saturating_sub(5).min(11);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Length(image_height),
-            Constraint::Length(1),
-            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(0),
         ])
-        .split(cols[0]);
+        .split(left);
     DetailsLayout {
-        image: rows[0],
-        title: rows[1],
-        artist: rows[2],
+        image: rows[2],
+        title: rows[0],
+        artist: rows[1],
         radio: rows[3],
         related: rows[4],
         lyrics: cols[1],
@@ -996,8 +1079,8 @@ fn draw(frame: &mut Frame, app: &App) {
         &app.input
     };
     let visible_width = left[0].width.saturating_sub(2) as usize;
-    let input_width = UnicodeWidthStr::width(app.input.as_str());
-    let scroll = input_width.saturating_sub(visible_width.saturating_sub(1));
+    let cursor_width = UnicodeWidthStr::width(&app.input[..app.input_cursor]);
+    let scroll = cursor_width.saturating_sub(visible_width.saturating_sub(1));
     frame.render_widget(
         Paragraph::new(search)
             .scroll((0, scroll.min(u16::MAX as usize) as u16))
@@ -1024,7 +1107,10 @@ fn draw(frame: &mut Frame, app: &App) {
         && !app.details_open
         && app.context.is_none()
     {
-        frame.set_cursor_position((left[0].x + 1 + (input_width - scroll) as u16, left[0].y + 1));
+        frame.set_cursor_position((
+            left[0].x + 1 + (cursor_width - scroll) as u16,
+            left[0].y + 1,
+        ));
     }
 
     let highlight = Style::default()
@@ -1036,7 +1122,12 @@ fn draw(frame: &mut Frame, app: &App) {
         .iter()
         .filter(|e| matches!(e, SearchEntry::Artist { .. }))
         .count();
-    let tracks = app.results.len() - artists;
+    let albums = app
+        .results
+        .iter()
+        .filter(|e| matches!(e, SearchEntry::Album { .. }))
+        .count();
+    let tracks = app.results.len() - artists - albums;
     let mut results = Vec::new();
     if artists > 0 {
         results.push(
@@ -1050,6 +1141,18 @@ fn draw(frame: &mut Frame, app: &App) {
     for entry in app.results.iter().take(artists) {
         results.push(ListItem::new(entry.title()));
     }
+    if albums > 0 {
+        results.push(
+            ListItem::new(" АЛЬБОМЫ").style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        );
+    }
+    for entry in app.results.iter().skip(artists).take(albums) {
+        results.push(ListItem::new(entry.title()));
+    }
     if tracks > 0 {
         results.push(
             ListItem::new(" ТРЕКИ").style(
@@ -1059,12 +1162,12 @@ fn draw(frame: &mut Frame, app: &App) {
             ),
         );
     }
-    for entry in app.results.iter().skip(artists) {
+    for entry in app.results.iter().skip(artists + albums) {
         results.push(ListItem::new(entry.title()));
     }
     let mut rs = ListState::default();
     if !app.results.is_empty() {
-        let row = result_row(app.selected, artists, app.results.len());
+        let row = result_row(app.selected, artists, albums, app.results.len());
         rs.select(Some(row));
         *rs.offset_mut() = list_offset(row, left[1].height.saturating_sub(2));
     }
@@ -1153,15 +1256,30 @@ fn draw(frame: &mut Frame, app: &App) {
         _ => 0.0,
     };
     let filled = (ratio * count as f64).round() as usize;
-    let progress = Line::from(vec![
-        Span::raw(format!("{elapsed} ")),
-        Span::styled("▰".repeat(filled), Style::default().fg(Color::Cyan)),
-        Span::styled(
-            "▱".repeat(count.saturating_sub(filled)),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::raw(format!(" {duration}")),
-    ]);
+    let mut segments = vec![Span::raw(format!("{elapsed} "))];
+    for index in 0..count {
+        let timestamp = app
+            .state
+            .duration
+            .filter(|d| d.is_finite() && *d > 0.0)
+            .map(|d| (index as f64 + 0.5) * d / count as f64);
+        let loaded = timestamp.is_some_and(|time| {
+            app.state
+                .buffered
+                .iter()
+                .any(|&(start, end)| time >= start && time <= end)
+        });
+        let (symbol, color) = if index < filled {
+            ("▰", Color::Cyan)
+        } else if loaded {
+            ("▰", Color::Gray)
+        } else {
+            ("▱", Color::DarkGray)
+        };
+        segments.push(Span::styled(symbol, Style::default().fg(color)));
+    }
+    segments.push(Span::raw(format!(" {duration}")));
+    let progress = Line::from(segments);
     frame.render_widget(
         Paragraph::new(progress).alignment(ratatui::layout::Alignment::Center),
         player_rows[3],
@@ -1398,7 +1516,14 @@ fn draw_cover(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                 List::new(
                     app.related
                         .iter()
-                        .map(|track| ListItem::new(track.title.as_str()))
+                        .map(|track| {
+                            ListItem::new(truncate_label(
+                                &track.title,
+                                usize::from(layout.related.width).saturating_sub(
+                                    if app.focus == Focus::Related { 2 } else { 0 },
+                                ),
+                            ))
+                        })
                         .collect::<Vec<_>>(),
                 )
                 .highlight_style(if app.focus == Focus::Related {
@@ -1740,6 +1865,76 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(Action::Toggle)));
     }
     #[test]
+    fn escape_and_control_c_do_not_quit() {
+        let (mut app, _) = make_app();
+        app.focus = Focus::Results;
+        assert!(app.key(press(KeyCode::Esc)));
+        assert!(app.focus == Focus::Search);
+        assert!(app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+        app.focus = Focus::Results;
+        assert!(!app.key(press(KeyCode::Char('q'))));
+    }
+    #[test]
+    fn search_input_supports_unicode_cursor_and_editing() {
+        let (mut app, _) = make_app();
+        for c in "кот猫".chars() {
+            app.key(press(KeyCode::Char(c)));
+        }
+        app.key(press(KeyCode::Left));
+        app.key(press(KeyCode::Backspace));
+        app.key(press(KeyCode::Char('р')));
+        assert_eq!(app.input, "кор猫");
+        app.key(press(KeyCode::Delete));
+        assert_eq!(app.input, "кор");
+        app.key(press(KeyCode::Home));
+        app.key(press(KeyCode::Char('!')));
+        app.key(press(KeyCode::End));
+        app.key(press(KeyCode::Char('?')));
+        assert_eq!(app.input, "!кор?");
+        assert_eq!(app.input_cursor, app.input.len());
+        assert_eq!(input_index_at_column("a猫z", 2), 1);
+        assert_eq!(input_index_at_column("a猫z", 3), 4);
+    }
+    #[test]
+    fn album_headers_and_selection_have_consistent_rows() {
+        assert_eq!(result_row(0, 1, 2, 4), 1);
+        assert_eq!(result_row(1, 1, 2, 4), 3);
+        assert_eq!(result_row(2, 1, 2, 4), 4);
+        assert_eq!(result_row(3, 1, 2, 4), 6);
+    }
+    #[test]
+    fn progress_colors_distinguish_played_cached_and_missing_ranges() {
+        let (mut app, _) = make_app();
+        app.state.position = Some(20.0);
+        app.state.duration = Some(100.0);
+        app.state.buffered = vec![(0.0, 60.0), (80.0, 90.0)];
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let (left, _) = main_layout(Rect::new(0, 0, 120, 40));
+        let player = panel("", false).inner(left[2]);
+        let bar = progress_rect(
+            Rect::new(player.x, player.y + 3, player.width, 1),
+            &app.state,
+        );
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer.cell((bar.x + 2, bar.y)).unwrap().fg, Color::Cyan);
+        assert_eq!(buffer.cell((bar.x + 10, bar.y)).unwrap().fg, Color::Gray);
+        assert_eq!(
+            buffer.cell((bar.x + 20, bar.y)).unwrap().fg,
+            Color::DarkGray
+        );
+        assert_eq!(buffer.cell((bar.x + 25, bar.y)).unwrap().fg, Color::Gray);
+    }
+    #[test]
+    fn related_titles_are_clipped_within_their_column() {
+        assert_eq!(truncate_label("Длинное название猫", 7), "Длинно…");
+        assert_eq!(truncate_label("猫猫", 3), "猫…");
+        let layout = details_layout(Rect::new(60, 0, 60, 26));
+        assert!(layout.title.y < layout.artist.y && layout.artist.y < layout.image.y);
+        assert!(layout.related.right() < layout.lyrics.x);
+    }
+    #[test]
     fn mouse_selects_visible_result_in_scrolled_list() {
         let (mut app, rx) = make_app();
         app.results = (0..60)
@@ -1754,7 +1949,7 @@ mod tests {
         let area = Rect::new(0, 0, 120, 30);
         let (left, _) = main_layout(area);
         let inner = panel("", false).inner(left[1]);
-        let row = result_row(app.selected, 0, app.results.len());
+        let row = result_row(app.selected, 0, 0, app.results.len());
         let offset = list_offset(row, inner.height);
         let clicked = offset + 2;
         let index = clicked - 1;
@@ -1945,7 +2140,10 @@ mod tests {
             lines
                 .iter()
                 .enumerate()
-                .find_map(|(y, line)| line.find(needle).map(|x| (x, y)))
+                .find_map(|(y, line)| {
+                    line.find(needle)
+                        .map(|x| (UnicodeWidthStr::width(&line[..x]), y))
+                })
                 .unwrap()
         };
         let (title_x, title_y) = positions("The Song");
@@ -1955,7 +2153,7 @@ mod tests {
         let (lyrics_x, _) = positions("Lyrics on right");
         assert!(
             title_x < lyrics_x && artist_x < lyrics_x && radio_x < lyrics_x && related_x < lyrics_x
-        );
+        , "title={title_x} artist={artist_x} radio={radio_x} related={related_x} lyrics={lyrics_x}");
         assert!(title_y < artist_y && artist_y < radio_y && radio_y < related_y);
     }
 

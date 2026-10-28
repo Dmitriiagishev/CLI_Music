@@ -62,6 +62,7 @@ pub fn search(query: &str, limit: usize) -> Result<Vec<SearchEntry>, String> {
     let (mode, value) = query
         .strip_prefix("musicartist:")
         .map(|id| ("artist", id))
+        .or_else(|| query.strip_prefix("musicalbum:").map(|id| ("album", id)))
         .unwrap_or(("search", query));
     let data = run(mode, value, limit)?;
     let entries = data.as_array().ok_or("Неверный формат результатов")?;
@@ -80,6 +81,10 @@ pub fn search(query: &str, limit: usize) -> Result<Vec<SearchEntry>, String> {
                     url: url.to_owned(),
                 })
             }
+            Some("album") if url.starts_with("musicalbum:") => results.push(SearchEntry::Album {
+                title: title.to_owned(),
+                url: url.to_owned(),
+            }),
             Some("track") if url.starts_with("https://music.youtube.com/watch?v=") => {
                 results.push(SearchEntry::Track(Track {
                     title: title.to_owned(),

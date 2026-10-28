@@ -43,13 +43,23 @@ def main():
         def search_kind(kind, count):
             client = YTMusic(requests_session=TimedSession(), language="en")
             return client.search(value, filter=kind, limit=count)
-        with ThreadPoolExecutor(max_workers=2) as pool:
+        with ThreadPoolExecutor(max_workers=3) as pool:
             artists_future = pool.submit(search_kind, "artists", 20)
+            albums_future = pool.submit(search_kind, "albums", 20)
             songs_future = pool.submit(search_kind, "songs", limit)
             artists = artists_future.result()
+            albums = albums_future.result()
             songs = songs_future.result()
         result = [{"type": "artist", "title": a.get("artist") or a.get("name") or "Исполнитель",
                    "url": "musicartist:" + a["browseId"]} for a in artists if a.get("browseId")]
+        for album in albums:
+            if not album.get("browseId"):
+                continue
+            names = ", ".join(a.get("name", "") for a in (album.get("artists") or []) if isinstance(a, dict) and a.get("name"))
+            names = names or album.get("artist") or ""
+            title = album.get("title") or "Без названия"
+            result.append({"type": "album", "title": (names + " — " if names else "") + title,
+                           "url": "musicalbum:" + album["browseId"]})
         result.extend([x for x in (song(s) for s in songs) if x][:limit])
         return result
     api = YTMusic(requests_session=TimedSession(), language="en")
@@ -63,6 +73,18 @@ def main():
         else:
             items = songs.get("results") or []
         return [x for x in (song(s) for s in items[:limit]) if x]
+    if mode == "album":
+        limit = max(1, int(sys.argv[3]))
+        album = api.get_album(value)
+        artist = album.get("artists") or []
+        items = []
+        for track in (album.get("tracks") or [])[:limit]:
+            item = dict(track)
+            if not item.get("artists"):
+                item["artists"] = artist
+            if entry := song(item):
+                items.append(entry)
+        return items
     if mode == "lyrics":
         playlist = api.get_watch_playlist(videoId=value, limit=1)
         lyrics_id = playlist.get("lyrics")
