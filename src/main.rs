@@ -1,5 +1,6 @@
 mod backend;
 mod cover;
+mod music;
 mod spectrum;
 
 #[cfg(test)]
@@ -56,6 +57,12 @@ struct App {
     cover: Option<image::RgbImage>,
     cover_status: String,
     levels: [f32; spectrum::BANDS],
+    lyrics: String,
+    lyrics_open: bool,
+    lyrics_scroll: u16,
+    auth_open: bool,
+    auth_selection: usize,
+    details_open: bool,
 }
 impl App {
     fn new(auth: Auth, actions: Sender<Action>, events: Sender<Event>) -> Self {
@@ -81,6 +88,12 @@ impl App {
             cover: None,
             cover_status: "Выберите трек".into(),
             levels: [0.0; spectrum::BANDS],
+            lyrics: "Выберите трек".into(),
+            lyrics_open: false,
+            lyrics_scroll: 0,
+            auth_open: false,
+            auth_selection: 0,
+            details_open: false,
         }
     }
     fn send(&self, action: Action) {
@@ -115,6 +128,21 @@ impl App {
                     self.cover_url = url;
                     self.cover_id = self.cover_id.wrapping_add(1);
                     self.cover = None;
+                    self.lyrics = if state.current.is_some() {
+                        "Загружаем текст…"
+                    } else {
+                        "Выберите трек"
+                    }
+                    .into();
+                    self.lyrics_scroll = 0;
+                    if let Some(track) = state.current.clone() {
+                        let id = self.cover_id;
+                        let events = self.events.clone();
+                        thread::spawn(move || {
+                            let result = music::lyrics(&track.url);
+                            let _ = events.send(Event::Lyrics(id, result));
+                        });
+                    }
                     self.cover_status = if state.current.is_some() {
                         "Загрузка обложки…"
                     } else {
@@ -170,6 +198,10 @@ impl App {
             },
             Event::Cover(_, _) => {}
             Event::Spectrum(levels) => self.levels = levels,
+            Event::Lyrics(id, result) if id == self.cover_id => {
+                self.lyrics = result.unwrap_or_else(|e| format!("Текст недоступен: {e}"))
+            }
+            Event::Lyrics(_, _) => {}
         }
     }
     fn toggle_queue(&mut self) {
@@ -186,15 +218,51 @@ impl App {
         match self.button {
             0 => self.send(Action::Previous),
             1 => self.send(Action::Toggle),
-            2 => self.send(Action::Next),
-            3 => self.send(Action::Stop),
-            4 => self.send(Action::Volume(-10)),
-            _ => self.send(Action::Volume(10)),
+            _ => self.send(Action::Next),
         }
+    }
+    fn choose_browser(&mut self) {
+        let browsers = ["firefox", "chrome", "chromium", "brave", "edge"];
+        let browser = browsers[self.auth_selection];
+        self.auth = Auth {
+            browser: Some(browser.to_owned()),
+            cookies: None,
+        };
+        self.send(Action::SetAuth(self.auth.clone()));
+        self.auth_open = false;
+        self.message = match save_browser(browser) {
+            Ok(()) => {
+                format!("Выбран {browser}. Войдите в YouTube в браузере и запустите трек снова.")
+            }
+            Err(e) => format!("Браузер выбран на этот запуск; сохранить выбор не удалось: {e}"),
+        };
     }
     fn key(&mut self, key: KeyEvent) -> bool {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return false;
+        }
+        if self.details_open {
+            self.details_open = false;
+            return true;
+        }
+        if self.auth_open {
+            match key.code {
+                KeyCode::Esc => self.auth_open = false,
+                KeyCode::Up => self.auth_selection = self.auth_selection.saturating_sub(1),
+                KeyCode::Down => self.auth_selection = (self.auth_selection + 1).min(4),
+                KeyCode::Enter => self.choose_browser(),
+                _ => {}
+            }
+            return true;
+        }
+        if self.lyrics_open {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('l') | KeyCode::Char('q') => self.lyrics_open = false,
+                KeyCode::Up => self.lyrics_scroll = self.lyrics_scroll.saturating_sub(1),
+                KeyCode::Down => self.lyrics_scroll = self.lyrics_scroll.saturating_add(1),
+                _ => {}
+            }
+            return true;
         }
         if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
             self.toggle_queue();
@@ -246,6 +314,10 @@ impl App {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return false,
             KeyCode::Char('/') => self.focus = Focus::Search,
+            KeyCode::Char('g') => self.auth_open = true,
+            KeyCode::Char('l') => self.lyrics_open = true,
+            KeyCode::Char('e') => self.details_open = true,
+            KeyCode::Char('s') => self.send(Action::Stop),
             KeyCode::Char(' ') if self.focus != Focus::Controls => self.send(Action::Toggle),
             KeyCode::Char('n') => self.send(Action::Next),
             KeyCode::Char('p') => self.send(Action::Previous),
@@ -294,7 +366,7 @@ impl App {
                 self.button = self.button.saturating_sub(1)
             }
             KeyCode::Right if self.focus == Focus::Controls => {
-                self.button = (self.button + 1).min(5)
+                self.button = (self.button + 1).min(2)
             }
             KeyCode::Enter => match self.focus {
                 Focus::Results => match self.results.get(self.selected).cloned() {
@@ -331,20 +403,20 @@ fn draw(frame: &mut Frame, app: &App) {
         );
         return;
     }
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(4),
-            Constraint::Length(4),
-        ])
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(area);
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(4)])
+        .split(columns[0]);
     let search = if app.input.is_empty() {
         "Введите название, исполнителя или ссылку…"
     } else {
         &app.input
     };
-    let visible_width = rows[0].width.saturating_sub(2) as usize;
+    let visible_width = left[0].width.saturating_sub(2) as usize;
     let input_width = UnicodeWidthStr::width(app.input.as_str());
     let scroll = input_width.saturating_sub(visible_width.saturating_sub(1));
     frame.render_widget(
@@ -363,16 +435,18 @@ fn draw(frame: &mut Frame, app: &App) {
                 },
                 app.focus == Focus::Search,
             )),
-        rows[0],
+        left[0],
     );
-    if app.focus == Focus::Search && visible_width > 0 {
-        frame.set_cursor_position((rows[0].x + 1 + (input_width - scroll) as u16, rows[0].y + 1));
+    if app.focus == Focus::Search
+        && visible_width > 0
+        && !app.queue_open
+        && !app.auth_open
+        && !app.lyrics_open
+        && !app.details_open
+    {
+        frame.set_cursor_position((left[0].x + 1 + (input_width - scroll) as u16, left[0].y + 1));
     }
 
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(rows[1]);
     let highlight = Style::default()
         .bg(Color::DarkGray)
         .fg(Color::White)
@@ -422,16 +496,18 @@ fn draw(frame: &mut Frame, app: &App) {
             ))
             .highlight_style(highlight)
             .highlight_symbol("▸ "),
-        columns[0],
+        left[1],
         &mut rs,
     );
-    let art_height = columns[1].height.saturating_sub(5).clamp(3, 13);
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(art_height), Constraint::Min(3)])
+        .constraints([
+            Constraint::Min(4),
+            Constraint::Length(7),
+            Constraint::Length(8),
+        ])
         .split(columns[1]);
     draw_cover(frame, right[0], app);
-    draw_spectrum(frame, right[1], app);
     let status = if app.state.loading {
         "Загрузка"
     } else if app.state.paused {
@@ -447,57 +523,39 @@ fn draw(frame: &mut Frame, app: &App) {
         .as_ref()
         .map(|t| t.title.as_str())
         .unwrap_or("Выберите трек");
-    let player_block = panel(" Сейчас ", app.focus == Focus::Controls);
-    let inside = player_block.inner(rows[2]);
-    frame.render_widget(player_block, rows[2]);
+    let player_block = panel(
+        " Плеер · G вход · L текст · E сообщение ",
+        app.focus == Focus::Controls,
+    );
+    let inside = player_block.inner(right[1]);
+    frame.render_widget(player_block, right[1]);
     let player_rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
         .split(inside);
-    let status_line = format!(
-        " {status} · {title} · Громкость {}%{}",
-        app.state.volume,
-        if app.message.is_empty() {
-            String::new()
-        } else {
-            format!(" · {}", app.message.replace(['\n', '\r'], " "))
-        }
+    frame.render_widget(
+        Paragraph::new(title)
+            .alignment(ratatui::layout::Alignment::Center)
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+        player_rows[0],
     );
-    frame.render_widget(Paragraph::new(status_line), player_rows[0]);
-    let labels = if rows[2].width < 75 {
-        [
-            "|◀",
-            if app.state.paused { "▶" } else { "Ⅱ" },
-            "▶|",
-            "■",
-            "−",
-            "+",
-        ]
-    } else {
-        [
-            "⏮ Назад",
-            if app.state.paused {
-                "▶ Продолжить"
-            } else {
-                "Ⅱ Пауза"
-            },
-            "⏭ Далее",
-            "■ Стоп",
-            "− Тише",
-            "+ Громче",
-        ]
-    };
+    frame.render_widget(
+        Paragraph::new(format!("{status} · {}%", app.state.volume))
+            .alignment(ratatui::layout::Alignment::Center)
+            .style(Style::default().fg(Color::Gray)),
+        player_rows[1],
+    );
+    let labels = ["⏮", if app.state.paused { "▶" } else { "Ⅱ" }, "⏭"];
     let buttons = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(16),
-            Constraint::Percentage(24),
-            Constraint::Percentage(16),
-            Constraint::Percentage(15),
-            Constraint::Percentage(14),
-            Constraint::Percentage(15),
-        ])
-        .split(player_rows[1]);
+        .constraints([Constraint::Ratio(1, 3); 3])
+        .split(player_rows[2]);
     for (i, label) in labels.iter().enumerate() {
         let style = if app.focus == Focus::Controls && app.button == i {
             Style::default()
@@ -514,6 +572,12 @@ fn draw(frame: &mut Frame, app: &App) {
             buttons[i],
         );
     }
+    frame.render_widget(
+        Paragraph::new(app.message.replace(['\n', '\r'], " "))
+            .style(Style::default().fg(Color::Gray)),
+        player_rows[3],
+    );
+    draw_spectrum(frame, right[2], app);
     if app.queue_open {
         let popup = centered(area, 75, 70);
         frame.render_widget(Clear, popup);
@@ -540,6 +604,46 @@ fn draw(frame: &mut Frame, app: &App) {
                 .highlight_symbol("▸ "),
             popup,
             &mut selection,
+        );
+    }
+    if app.auth_open {
+        let popup = centered(area, 70, 70);
+        frame.render_widget(Clear, popup);
+        let browsers = ["Firefox", "Chrome", "Chromium", "Brave", "Edge"];
+        let mut selection = ListState::default();
+        selection.select(Some(app.auth_selection));
+        let items: Vec<_> = browsers.iter().map(|name| ListItem::new(*name)).collect();
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(panel(
+                    " Войдите в YouTube в браузере · выберите его · Enter ",
+                    true,
+                ))
+                .highlight_style(highlight)
+                .highlight_symbol("▸ "),
+            popup,
+            &mut selection,
+        );
+    }
+    if app.details_open {
+        let popup = centered(area, 75, 50);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(app.message.as_str())
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .block(panel(" Сообщение · любая клавиша закрывает ", true)),
+            popup,
+        );
+    }
+    if app.lyrics_open {
+        let popup = centered(area, 75, 80);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(app.lyrics.as_str())
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .scroll((app.lyrics_scroll, 0))
+                .block(panel(" Текст · ↑↓ прокрутка · Esc закрыть ", true)),
+            popup,
         );
     }
 }
@@ -619,44 +723,53 @@ fn draw_spectrum(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     let block = panel(" Частоты ", false);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    if inner.width < 8 || inner.height == 0 {
+    if inner.width < spectrum::BANDS as u16 || inner.height == 0 {
         return;
     }
-    let has_labels = inner.height >= 3 && inner.width >= 24;
-    let height = inner.height.saturating_sub(u16::from(has_labels));
+    let labels = inner.height >= 3 && inner.width >= 32;
+    let height = inner.height.saturating_sub(u16::from(labels));
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Ratio(1, 8); spectrum::BANDS])
+        .constraints([Constraint::Ratio(1, 16); spectrum::BANDS])
         .split(inner);
-    let labels = ["63", "125", "250", "500", "1k", "2k", "4k", "8k"];
+    let frequency = [
+        "63", "", "125", "", "250", "", "500", "", "1k", "", "2k", "", "4k", "", "8k", "",
+    ];
     for (index, column) in columns.iter().enumerate() {
-        let bar_height = (app.levels[index] * f32::from(height)).round() as u16;
+        let lit = (app.levels[index] * f32::from(height)).round() as u16;
         for row in 0..height {
-            let character = if height - row <= bar_height {
-                "█"
-            } else {
-                "·"
-            };
-            let bar = ratatui::layout::Rect::new(column.x, inner.y + row, column.width, 1);
+            let bottom = height - row;
+            if bottom > lit {
+                continue;
+            }
+            let fraction = f32::from(bottom) / f32::from(height);
+            let color = spectrum_color(fraction);
+            let segment = "─".repeat(usize::from(column.width.saturating_sub(1).max(1)));
             frame.render_widget(
-                Paragraph::new(character)
+                Paragraph::new(segment)
                     .alignment(ratatui::layout::Alignment::Center)
-                    .style(Style::default().fg(if character == "█" {
-                        Color::Cyan
-                    } else {
-                        Color::DarkGray
-                    })),
-                bar,
+                    .style(Style::default().fg(color)),
+                ratatui::layout::Rect::new(column.x, inner.y + row, column.width, 1),
             );
         }
-        if has_labels {
+        if labels {
             frame.render_widget(
-                Paragraph::new(labels[index])
+                Paragraph::new(frequency[index])
                     .alignment(ratatui::layout::Alignment::Center)
                     .style(Style::default().fg(Color::Gray)),
                 ratatui::layout::Rect::new(column.x, inner.y + height, column.width, 1),
             );
         }
+    }
+}
+
+fn spectrum_color(fraction: f32) -> Color {
+    if fraction <= 0.5 {
+        Color::Reset
+    } else if fraction <= 0.8 {
+        Color::Rgb(216, 139, 72)
+    } else {
+        Color::Rgb(121, 44, 67)
     }
 }
 
@@ -688,8 +801,7 @@ fn run(auth: Auth) -> io::Result<()> {
             while let Ok(event) = event_rx.try_recv() {
                 app.handle_event(event);
             }
-            app.result_limit =
-                usize::from(terminal.size()?.height.saturating_sub(11)).clamp(1, 100);
+            app.result_limit = usize::from(terminal.size()?.height.saturating_sub(7)).clamp(1, 100);
             terminal.draw(|frame| draw(frame, &app))?;
             if event::poll(Duration::from_millis(100))? {
                 if let TermEvent::Key(key) = event::read()? {
@@ -705,6 +817,37 @@ fn run(auth: Auth) -> io::Result<()> {
     let _ = worker.join();
     result
 }
+fn browser_path() -> Option<std::path::PathBuf> {
+    env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(|home| {
+            std::path::PathBuf::from(home)
+                .join(".cli-music")
+                .join("browser")
+        })
+}
+fn load_browser() -> Option<String> {
+    let name = std::fs::read_to_string(browser_path()?)
+        .ok()?
+        .trim()
+        .to_owned();
+    ["firefox", "chrome", "chromium", "brave", "edge"]
+        .contains(&name.as_str())
+        .then_some(name)
+}
+fn save_browser(name: &str) -> io::Result<()> {
+    use std::io::Write;
+    let path = browser_path().ok_or_else(|| io::Error::other("Домашняя папка недоступна"))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("Каталог настроек недоступен"))?;
+    std::fs::create_dir_all(parent)?;
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    file.write_all(name.as_bytes())?;
+    file.persist(path).map_err(|e| e.error)?;
+    Ok(())
+}
+
 fn main() {
     let mut auth = Auth::default();
     let mut args = env::args().skip(1);
@@ -731,6 +874,9 @@ fn main() {
     if auth.browser.is_some() && auth.cookies.is_some() {
         eprintln!("Выберите --browser или --cookies.");
         std::process::exit(2);
+    }
+    if auth.browser.is_none() && auth.cookies.is_none() {
+        auth.browser = load_browser();
     }
     if let Err(e) = run(auth) {
         eprintln!("Ошибка: {e}");
@@ -817,6 +963,25 @@ mod tests {
         assert!(app.cover.is_none());
     }
 
+    #[test]
+    fn spectrum_uses_theme_color_then_orange_and_burgundy() {
+        assert_eq!(spectrum::BANDS, 16);
+        assert_eq!(spectrum_color(0.5), Color::Reset);
+        assert_eq!(spectrum_color(0.65), Color::Rgb(216, 139, 72));
+        assert_eq!(spectrum_color(0.9), Color::Rgb(121, 44, 67));
+    }
+    #[test]
+    fn browser_picker_moves_selection() {
+        let (mut app, rx) = make_app();
+        app.focus = Focus::Results;
+        app.key(press(KeyCode::Char('g')));
+        assert!(app.auth_open);
+        app.key(press(KeyCode::Down));
+        // Selection is passed to the player; no credentials are copied.
+        // Avoid saving to a user's home in a unit test by checking the picker before Enter.
+        assert_eq!(app.auth_selection, 1);
+        assert!(rx.try_recv().is_err());
+    }
     #[test]
     fn older_search_response_cannot_replace_new_results() {
         let (mut app, _) = make_app();

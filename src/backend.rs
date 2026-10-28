@@ -99,6 +99,9 @@ pub fn lookup(
     auth: &Auth,
     limit: usize,
 ) -> Result<(Vec<SearchEntry>, String), String> {
+    if !query.starts_with("https://") && !query.starts_with("http://") {
+        return crate::music::search(query, limit).map(|results| (results, String::new()));
+    }
     let mut cmd = Command::new("yt-dlp");
     auth.apply(&mut cmd);
     let limit = limit.clamp(1, 100);
@@ -304,6 +307,7 @@ pub enum Action {
     Previous,
     Stop,
     Volume(i32),
+    SetAuth(Auth),
     Quit,
 }
 pub enum Event {
@@ -312,12 +316,13 @@ pub enum Event {
     Search(u64, Result<(Vec<SearchEntry>, String), String>),
     Cover(u64, Result<image::RgbImage, String>),
     Spectrum([f32; crate::spectrum::BANDS]),
+    Lyrics(u64, Result<String, String>),
 }
 enum Resolved {
     Ready(u64, Track, Result<String, String>),
 }
 
-pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, auth: Auth) {
+pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) {
     let mut state = State {
         volume: 100,
         ..State::default()
@@ -509,6 +514,7 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, auth: Auth) {
                     }
                 }
             }
+            Ok(Action::SetAuth(updated)) => auth = updated,
             Ok(Action::Quit) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
         }

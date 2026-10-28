@@ -12,3 +12,5 @@ unicode-width = "0.2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 tempfile = "3"
 sha2 = "0.10"
+
+serde_json = "1"

@@ -3,8 +3,10 @@ use std::{
     io::{Read, Seek, SeekFrom},
     path::PathBuf,
 };
-pub const BANDS: usize = 8;
-const FREQUENCIES: [u32; BANDS] = [63, 125, 250, 500, 1000, 2000, 4000, 8000];
+pub const BANDS: usize = 16;
+const FREQUENCIES: [u32; BANDS] = [
+    63, 90, 125, 180, 250, 350, 500, 700, 1000, 1400, 2000, 2800, 4000, 5600, 8000, 12000,
+];
 pub struct Spectrum {
     _directory: tempfile::TempDir,
     files: Vec<PathBuf>,
@@ -77,11 +79,11 @@ mod tests {
     fn latest_levels_reflect_frequency_metadata_and_silence() {
         let spectrum = Spectrum::new().unwrap();
         std::fs::write(&spectrum.files[0], "frame:0\nlavfi.astats.Overall.RMS_level=-55\nframe:1\nlavfi.astats.Overall.RMS_level=-50\n").unwrap();
-        std::fs::write(&spectrum.files[4], "lavfi.astats.Overall.RMS_level=-10\n").unwrap();
+        std::fs::write(&spectrum.files[8], "lavfi.astats.Overall.RMS_level=-10\n").unwrap();
         std::fs::write(&spectrum.files[7], "lavfi.astats.Overall.RMS_level=-inf\n").unwrap();
         let levels = spectrum.levels();
         assert!((levels[0] - 0.2).abs() < 0.001);
-        assert_eq!(levels[4], 1.0);
+        assert_eq!(levels[8], 1.0);
         assert_eq!(levels[7], 0.0);
     }
 }
