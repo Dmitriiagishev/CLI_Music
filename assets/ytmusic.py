@@ -24,6 +24,14 @@ def song(item):
     return {"type": "track", "title": (artists + " — " if artists else "") + title,
             "url": "https://music.youtube.com/watch?v=" + video}
 
+def lyric_text(data):
+    lyrics = (data or {}).get("lyrics")
+    if isinstance(lyrics, str):
+        return lyrics or "Текст песни недоступен"
+    if isinstance(lyrics, list):
+        return "\n".join(line.get("text", "") for line in lyrics if isinstance(line, dict)) or "Текст песни недоступен"
+    return "Текст песни недоступен"
+
 def main():
     mode, value = sys.argv[1:3]
     # Filtered search in ytmusicapi 1.12.x matches English shelf names
@@ -63,12 +71,43 @@ def main():
         data = api.get_lyrics(lyrics_id)
         if not data:
             return "Текст песни недоступен"
-        lyrics = data.get("lyrics")
-        if isinstance(lyrics, str):
-            return lyrics or "Текст песни недоступен"
-        if isinstance(lyrics, list):
-            return "\n".join(line.get("text", "") for line in lyrics if isinstance(line, dict)) or "Текст песни недоступен"
-        return "Текст песни недоступен"
+        return lyric_text(data)
+    if mode == "details":
+        watch = api.get_watch_playlist(videoId=value, limit=1)
+        def load_lyrics():
+            if not watch.get("lyrics"):
+                return "Текст песни недоступен"
+            try:
+                return lyric_text(YTMusic(requests_session=TimedSession(), language="en").get_lyrics(watch["lyrics"]))
+            except Exception as error:
+                return "Текст недоступен: " + str(error)
+        def load_related():
+            if not watch.get("related"):
+                return []
+            return YTMusic(requests_session=TimedSession(), language="en").get_song_related(watch["related"])
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            lyrics_future = pool.submit(load_lyrics)
+            related_future = pool.submit(load_related)
+            lyrics = lyrics_future.result()
+            try:
+                sections = related_future.result()
+                error = ""
+            except Exception as exc:
+                sections, error = [], "Похожие песни недоступны: " + str(exc)
+        found, seen = [], {value}
+        for section in sections:
+            contents = section.get("contents")
+            if not isinstance(contents, list):
+                continue
+            for item in contents:
+                if isinstance(item, dict) and item.get("videoId") and item["videoId"] not in seen:
+                    seen.add(item["videoId"])
+                    if entry := song(item):
+                        found.append(entry)
+        return {"lyrics": lyrics, "related": found, "related_error": error}
+    if mode == "radio":
+        watch = api.get_watch_playlist(videoId=value, radio=True, limit=50)
+        return [entry for item in (watch.get("tracks") or []) if item.get("videoId") != value and (entry := song(item))]
     raise ValueError("Неизвестный запрос")
 
 try:

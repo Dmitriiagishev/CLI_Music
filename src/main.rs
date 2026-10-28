@@ -36,6 +36,7 @@ enum Focus {
     Results,
     Queue,
     Controls,
+    Related,
 }
 struct ContextMenu {
     track: Track,
@@ -71,6 +72,10 @@ struct App {
     cover_status: String,
     levels: [f32; spectrum::BANDS],
     lyrics: String,
+    related: Vec<Track>,
+    related_status: String,
+    related_selected: usize,
+    radio_loading: bool,
     lyrics_open: bool,
     lyrics_scroll: u16,
     auth_open: bool,
@@ -108,6 +113,10 @@ impl App {
             cover_status: "Выберите трек".into(),
             levels: [0.0; spectrum::BANDS],
             lyrics: "Выберите трек".into(),
+            related: Vec::new(),
+            related_status: String::new(),
+            related_selected: 0,
+            radio_loading: false,
             lyrics_open: false,
             lyrics_scroll: 0,
             auth_open: false,
@@ -164,6 +173,15 @@ impl App {
                     self.cover_url = url;
                     self.cover_id = self.cover_id.wrapping_add(1);
                     self.cover = None;
+                    self.related.clear();
+                    self.related_selected = 0;
+                    self.radio_loading = false;
+                    self.related_status = if state.current.is_some() {
+                        "Загружаем похожие песни…"
+                    } else {
+                        ""
+                    }
+                    .into();
                     self.lyrics = if state.current.is_some() {
                         "Загружаем текст…"
                     } else {
@@ -175,8 +193,8 @@ impl App {
                         let id = self.cover_id;
                         let events = self.events.clone();
                         thread::spawn(move || {
-                            let result = music::lyrics(&track.url);
-                            let _ = events.send(Event::Lyrics(id, result));
+                            let result = music::details(&track.url);
+                            let _ = events.send(Event::Details(id, result));
                         });
                     }
                     self.cover_status = if state.current.is_some() {
@@ -261,8 +279,17 @@ impl App {
                             self.send(Action::Add(tail));
                         }
                     } else {
-                        self.message =
-                            "Список изменился: остальные треки не добавлены автоматически".into();
+                        let known: std::collections::HashSet<_> =
+                            initial.iter().map(|track| track.url.as_str()).collect();
+                        let mut seen = known.clone();
+                        let tail: Vec<_> = tracks
+                            .iter()
+                            .filter(|track| seen.insert(track.url.as_str()))
+                            .cloned()
+                            .collect();
+                        if !tail.is_empty() {
+                            self.send(Action::Add(tail));
+                        }
                     }
                 }
                 Err(error) => {
@@ -279,10 +306,43 @@ impl App {
             },
             Event::Cover(_, _) => {}
             Event::Spectrum(levels) => self.levels = levels,
-            Event::Lyrics(id, result) if id == self.cover_id => {
-                self.lyrics = result.unwrap_or_else(|e| format!("Текст недоступен: {e}"))
+            Event::Details(id, result) if id == self.cover_id => match result {
+                Ok(details) => {
+                    self.lyrics = details.lyrics;
+                    self.related = details.related;
+                    self.related_status = if !details.related_error.is_empty() {
+                        details.related_error
+                    } else if self.related.is_empty() {
+                        "Похожие песни не найдены".into()
+                    } else {
+                        String::new()
+                    };
+                }
+                Err(error) => {
+                    self.lyrics = format!("Текст недоступен: {error}");
+                    self.related_status = format!("Похожие песни недоступны: {error}");
+                }
+            },
+            Event::Details(_, _) => {}
+            Event::Radio(id, generation, result)
+                if id == self.cover_id && generation == self.queue_generation =>
+            {
+                self.radio_loading = false;
+                match result {
+                    Ok(tracks) if !tracks.is_empty() => {
+                        let count = tracks.len();
+                        if let Some(track) = &self.state.current {
+                            self.send(Action::ReplaceQueue(track.url.clone(), tracks));
+                            self.message = format!("Радио включено: {count} треков в очереди");
+                        } else {
+                            self.message = "Трек сменился: радио не включено".into();
+                        }
+                    }
+                    Ok(_) => self.message = "Радио для этой песни недоступно".into(),
+                    Err(error) => self.message = format!("Не удалось включить радио: {error}"),
+                }
             }
-            Event::Lyrics(_, _) => {}
+            Event::Radio(_, _, _) => {}
         }
     }
     fn toggle_queue(&mut self) {
@@ -303,6 +363,20 @@ impl App {
         }
     }
     fn play_from(&mut self, track: &Track) {
+        if self.focus == Focus::Related {
+            if let Some(index) = self
+                .related
+                .get(self.related_selected)
+                .filter(|item| *item == track)
+                .map(|_| self.related_selected)
+                .or_else(|| self.related.iter().position(|item| item == track))
+            {
+                self.queue_generation = self.queue_generation.wrapping_add(1);
+                self.radio_loading = false;
+                self.send(Action::PlayList(self.related[index..].to_vec()));
+                return;
+            }
+        }
         let Some(index) = self
             .results
             .get(self.selected)
@@ -314,6 +388,11 @@ impl App {
                     .position(|entry| matches!(entry, SearchEntry::Track(item) if item == track))
             })
         else {
+            if let Some(index) = self.related.iter().position(|item| item == track) {
+                self.queue_generation = self.queue_generation.wrapping_add(1);
+                self.radio_loading = false;
+                self.send(Action::PlayList(self.related[index..].to_vec()));
+            }
             return;
         };
         let tracks = self.results[index..]
@@ -324,6 +403,7 @@ impl App {
             })
             .collect();
         self.queue_generation = self.queue_generation.wrapping_add(1);
+        self.radio_loading = false;
         if self.has_more {
             let initial = self
                 .results
@@ -343,6 +423,23 @@ impl App {
             });
         }
         self.send(Action::PlayList(tracks));
+    }
+    fn start_radio(&mut self) {
+        let Some(track) = self.state.current.clone() else {
+            return;
+        };
+        if self.radio_loading {
+            return;
+        }
+        self.queue_generation = self.queue_generation.wrapping_add(1);
+        self.radio_loading = true;
+        self.message = "Загружаем радио…".into();
+        let id = self.cover_id;
+        let generation = self.queue_generation;
+        let events = self.events.clone();
+        thread::spawn(move || {
+            let _ = events.send(Event::Radio(id, generation, music::radio(&track.url)));
+        });
     }
     fn context_action(&mut self) {
         if let Some(menu) = self.context.take() {
@@ -459,7 +556,19 @@ impl App {
             };
             return;
         }
-        if scroll != 0 && contains(right[0]) {
+        let details = details_layout(right[0]);
+        if scroll != 0 && contains(details.related) && !self.related.is_empty() {
+            self.focus = Focus::Related;
+            self.related_selected = if scroll < 0 {
+                self.related_selected.saturating_sub(3)
+            } else {
+                self.related_selected
+                    .saturating_add(3)
+                    .min(self.related.len() - 1)
+            };
+            return;
+        }
+        if scroll != 0 && contains(details.lyrics) {
             self.lyrics_scroll = if scroll < 0 {
                 self.lyrics_scroll.saturating_sub(3)
             } else {
@@ -470,7 +579,22 @@ impl App {
         if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
             return;
         }
-        if contains(left[0]) {
+        if contains(details.radio) && self.state.current.is_some() {
+            self.start_radio();
+        } else if contains(details.related) && !self.related.is_empty() {
+            let index = list_offset(self.related_selected, details.related.height)
+                + usize::from(mouse.row - details.related.y);
+            if let Some(track) = self.related.get(index).cloned() {
+                self.related_selected = index;
+                self.focus = Focus::Related;
+                self.context = Some(ContextMenu {
+                    track,
+                    choice: 0,
+                    x: mouse.column,
+                    y: mouse.row,
+                });
+            }
+        } else if contains(left[0]) {
             self.focus = Focus::Search;
         } else if contains(results) {
             let artists = self
@@ -537,6 +661,22 @@ impl App {
                         / usize::from(player.width))
                     .min(2);
                     self.activate_button();
+                } else if mouse.row == player.y + 3 {
+                    let bar = progress_rect(
+                        Rect::new(player.x, player.y + 3, player.width, 1),
+                        &self.state,
+                    );
+                    if contains(bar) && bar.width > 1 {
+                        if let Some(duration) =
+                            self.state.duration.filter(|d| d.is_finite() && *d > 0.0)
+                        {
+                            let fraction =
+                                f64::from(mouse.column - bar.x) / f64::from(bar.width - 1);
+                            self.send(Action::Seek(
+                                (duration * fraction).min((duration - 0.2).max(0.0)),
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -658,6 +798,7 @@ impl App {
             KeyCode::Char('q') | KeyCode::Esc => return false,
             KeyCode::Char('/') => self.focus = Focus::Search,
             KeyCode::Char('g') => self.auth_open = true,
+            KeyCode::Char('r') => self.start_radio(),
             KeyCode::Char('l') => self.lyrics_open = true,
             KeyCode::Char('e') => {
                 self.details_scroll = 0;
@@ -665,6 +806,7 @@ impl App {
             }
             KeyCode::Char('s') => {
                 self.queue_generation = self.queue_generation.wrapping_add(1);
+                self.radio_loading = false;
                 self.send(Action::Stop);
             }
             KeyCode::Char(' ') if self.focus != Focus::Controls => self.send(Action::Toggle),
@@ -702,6 +844,7 @@ impl App {
                         Focus::Results
                     }
                 }
+                Focus::Related => self.related_selected = self.related_selected.saturating_sub(1),
                 _ => {}
             },
             KeyCode::Down => match self.focus {
@@ -711,6 +854,10 @@ impl App {
                     }
                 }
                 Focus::Results => self.selected += 1,
+                Focus::Related => {
+                    self.related_selected =
+                        (self.related_selected + 1).min(self.related.len().saturating_sub(1))
+                }
                 _ => {}
             },
             KeyCode::Left if self.focus == Focus::Controls => {
@@ -719,6 +866,10 @@ impl App {
             KeyCode::Right if self.focus == Focus::Controls => {
                 self.button = (self.button + 1).min(2)
             }
+            KeyCode::Right if self.focus == Focus::Results && !self.related.is_empty() => {
+                self.focus = Focus::Related
+            }
+            KeyCode::Left if self.focus == Focus::Related => self.focus = Focus::Results,
             KeyCode::Enter => match self.focus {
                 Focus::Results => match self.results.get(self.selected).cloned() {
                     Some(SearchEntry::Track(track)) => self.play_from(&track),
@@ -726,6 +877,11 @@ impl App {
                     None => {}
                 },
                 Focus::Controls => self.activate_button(),
+                Focus::Related => {
+                    if let Some(track) = self.related.get(self.related_selected).cloned() {
+                        self.play_from(&track);
+                    }
+                }
                 _ => {}
             },
             KeyCode::Char(' ') if self.focus == Focus::Controls => self.activate_button(),
@@ -750,6 +906,60 @@ fn list_offset(selected: usize, height: u16) -> usize {
 }
 fn result_row(index: usize, artists: usize, total: usize) -> usize {
     index + usize::from(artists > 0) + usize::from(total > artists && index >= artists)
+}
+fn format_time(value: Option<f64>) -> String {
+    match value {
+        Some(value) if value.is_finite() && value >= 0.0 => {
+            let seconds = value as u64;
+            format!("{}:{:02}", seconds / 60, seconds % 60)
+        }
+        _ => "--:--".into(),
+    }
+}
+fn progress_rect(row: Rect, state: &State) -> Rect {
+    let elapsed = format_time(state.position);
+    let duration = format_time(state.duration);
+    let count = usize::from(row.width)
+        .saturating_sub(elapsed.len() + duration.len() + 2)
+        .min(30);
+    let total = elapsed.len() + duration.len() + count + 2;
+    let start =
+        row.x + (usize::from(row.width).saturating_sub(total) / 2 + elapsed.len() + 1) as u16;
+    Rect::new(start, row.y, count as u16, row.height)
+}
+struct DetailsLayout {
+    image: Rect,
+    title: Rect,
+    artist: Rect,
+    radio: Rect,
+    related: Rect,
+    lyrics: Rect,
+}
+fn details_layout(area: Rect) -> DetailsLayout {
+    let inner = panel("", false).inner(area);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(inner);
+    let image_height = cols[0].height.saturating_sub(5).min(11);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(image_height),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(cols[0]);
+    DetailsLayout {
+        image: rows[0],
+        title: rows[1],
+        artist: rows[2],
+        radio: rows[3],
+        related: rows[4],
+        lyrics: cols[1],
+    }
 }
 fn main_layout(area: Rect) -> (std::rc::Rc<[Rect]>, std::rc::Rc<[Rect]>) {
     let columns = Layout::default()
@@ -935,18 +1145,9 @@ fn draw(frame: &mut Frame, app: &App) {
             buttons[i],
         );
     }
-    let format_time = |value: Option<f64>| match value {
-        Some(value) if value.is_finite() && value >= 0.0 => {
-            let seconds = value as u64;
-            format!("{}:{:02}", seconds / 60, seconds % 60)
-        }
-        _ => "--:--".into(),
-    };
     let elapsed = format_time(app.state.position);
     let duration = format_time(app.state.duration);
-    let available =
-        usize::from(player_rows[3].width).saturating_sub(elapsed.len() + duration.len() + 2);
-    let count = available.min(30);
+    let count = usize::from(progress_rect(player_rows[3], &app.state).width);
     let ratio = match (app.state.position, app.state.duration) {
         (Some(position), Some(duration)) if duration > 0.0 => (position / duration).clamp(0.0, 1.0),
         _ => 0.0,
@@ -1101,16 +1302,20 @@ fn draw_cover(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         return;
     }
     let has_color = !env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
-    let image_rows = if app.cover.is_some() && has_color {
-        inner.height.saturating_sub(3).min(11)
-    } else {
-        1
-    };
-    if let Some(image) = app.cover.as_ref().filter(|_| has_color && image_rows > 0) {
-        let side = inner.width.min(image_rows.saturating_mul(2)).min(22) as u32;
+    let layout = details_layout(area);
+    if let Some(image) = app
+        .cover
+        .as_ref()
+        .filter(|_| has_color && layout.image.height > 0)
+    {
+        let side = layout
+            .image
+            .width
+            .min(layout.image.height.saturating_mul(2))
+            .min(22) as u32;
         if side > 0 {
             let image = image::imageops::thumbnail(image, side, side);
-            let x = inner.x + (inner.width - image.width() as u16) / 2;
+            let x = layout.image.x;
             let rows = (image.height() as u16).div_ceil(2);
             for row in 0..rows {
                 let mut spans = Vec::new();
@@ -1130,37 +1335,86 @@ fn draw_cover(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                 }
                 frame.render_widget(
                     Paragraph::new(Line::from(spans)),
-                    ratatui::layout::Rect::new(x, inner.y + row, image.width() as u16, 1),
+                    ratatui::layout::Rect::new(x, layout.image.y + row, image.width() as u16, 1),
                 );
             }
         }
-    } else if image_rows > 0 {
+    } else if layout.image.height > 0 {
         let text = if !has_color && app.cover.is_some() {
             "Для обложки включите цвета терминала"
         } else {
             app.cover_status.as_str()
         };
         frame.render_widget(
-            Paragraph::new(text).alignment(ratatui::layout::Alignment::Center),
-            ratatui::layout::Rect::new(inner.x, inner.y, inner.width, 1),
+            Paragraph::new(text),
+            Rect::new(layout.image.x, layout.image.y, layout.image.width, 1),
         );
     }
-    let offset = (image_rows + 1).min(inner.height);
-    let text_area = ratatui::layout::Rect::new(
-        inner.x,
-        inner.y + offset,
-        inner.width,
-        inner.height - offset,
-    );
-    if text_area.height > 0 && app.state.current.is_some() {
+    if let Some(track) = &app.state.current {
+        let (artist, title) = track
+            .title
+            .split_once(" — ")
+            .unwrap_or(("", track.title.as_str()));
+        frame.render_widget(
+            Paragraph::new(title).style(Style::default().add_modifier(Modifier::BOLD)),
+            layout.title,
+        );
+        frame.render_widget(
+            Paragraph::new(artist).style(Style::default().fg(Color::Gray)),
+            layout.artist,
+        );
+        frame.render_widget(
+            Paragraph::new(if app.radio_loading {
+                "Загружаем радио…"
+            } else {
+                "▶ Радио по песне"
+            })
+            .style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            layout.radio,
+        );
         frame.render_widget(
             Paragraph::new(app.lyrics.as_str())
                 .wrap(ratatui::widgets::Wrap { trim: false })
                 .scroll((app.lyrics_scroll, 0))
-                .alignment(ratatui::layout::Alignment::Center)
                 .style(Style::default().fg(Color::Gray)),
-            text_area,
+            layout.lyrics,
         );
+        if app.related.is_empty() {
+            frame.render_widget(
+                Paragraph::new(app.related_status.as_str())
+                    .style(Style::default().fg(Color::Gray))
+                    .wrap(ratatui::widgets::Wrap { trim: true }),
+                layout.related,
+            );
+        } else {
+            let mut state = ListState::default();
+            state.select(Some(app.related_selected));
+            *state.offset_mut() = list_offset(app.related_selected, layout.related.height);
+            frame.render_stateful_widget(
+                List::new(
+                    app.related
+                        .iter()
+                        .map(|track| ListItem::new(track.title.as_str()))
+                        .collect::<Vec<_>>(),
+                )
+                .highlight_style(if app.focus == Focus::Related {
+                    Style::default().bg(Color::DarkGray).fg(Color::White)
+                } else {
+                    Style::default()
+                })
+                .highlight_symbol(if app.focus == Focus::Related {
+                    "▸ "
+                } else {
+                    ""
+                }),
+                layout.related,
+                &mut state,
+            );
+        }
     }
 }
 
@@ -1662,6 +1916,115 @@ mod tests {
         assert!(!lines
             .iter()
             .any(|line| line.contains("Обложка") || line.contains("Частоты")));
+    }
+
+    #[test]
+    fn artwork_metadata_radio_and_lyrics_use_separate_columns() {
+        let (mut app, _) = make_app();
+        app.state.current = Some(Track {
+            title: "The Band — The Song".into(),
+            url: "url".into(),
+        });
+        app.lyrics = "Lyrics on right".into();
+        app.related = vec![Track {
+            title: "Related track".into(),
+            url: "related".into(),
+        }];
+        let backend = ratatui::backend::TestBackend::new(140, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let lines: Vec<String> = (0..40)
+            .map(|y| {
+                (0..140)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect()
+            })
+            .collect();
+        let positions = |needle: &str| {
+            lines
+                .iter()
+                .enumerate()
+                .find_map(|(y, line)| line.find(needle).map(|x| (x, y)))
+                .unwrap()
+        };
+        let (title_x, title_y) = positions("The Song");
+        let (artist_x, artist_y) = positions("The Band");
+        let (radio_x, radio_y) = positions("Радио по песне");
+        let (related_x, related_y) = positions("Related track");
+        let (lyrics_x, _) = positions("Lyrics on right");
+        assert!(
+            title_x < lyrics_x && artist_x < lyrics_x && radio_x < lyrics_x && related_x < lyrics_x
+        );
+        assert!(title_y < artist_y && artist_y < radio_y && radio_y < related_y);
+    }
+
+    #[test]
+    fn clicking_progress_sends_seek_and_radio_replaces_queue() {
+        let (mut app, rx) = make_app();
+        app.state.current = Some(Track {
+            title: "Band — Song".into(),
+            url: "https://music.youtube.com/watch?v=id".into(),
+        });
+        app.state.duration = Some(120.0);
+        app.state.position = Some(20.0);
+        let area = Rect::new(0, 0, 120, 40);
+        let (left, _) = main_layout(area);
+        let player = panel("", false).inner(left[2]);
+        let bar = progress_rect(
+            Rect::new(player.x, player.y + 3, player.width, 1),
+            &app.state,
+        );
+        app.mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: bar.x + bar.width - 1,
+                row: bar.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(Action::Seek(position)) if (position - 119.8).abs() < 0.01)
+        );
+        app.cover_id = 5;
+        app.queue_generation = 7;
+        app.radio_loading = true;
+        let tracks = vec![Track {
+            title: "mix".into(),
+            url: "url".into(),
+        }];
+        app.handle_event(Event::Radio(5, 7, Ok(tracks.clone())));
+        assert!(
+            matches!(rx.try_recv(), Ok(Action::ReplaceQueue(source, items)) if source.ends_with("v=id") && items == tracks)
+        );
+        assert!(!app.radio_loading);
+        app.handle_event(Event::Radio(4, 7, Ok(tracks)));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn reordered_queue_tail_appends_new_songs_without_duplicates() {
+        let (mut app, rx) = make_app();
+        let track = |id: &str| Track {
+            title: id.into(),
+            url: id.into(),
+        };
+        app.queue_generation = 8;
+        app.handle_event(Event::QueueTail(
+            8,
+            vec![track("one"), track("two")],
+            Ok(vec![
+                SearchEntry::Track(track("two")),
+                SearchEntry::Track(track("three")),
+                SearchEntry::Track(track("one")),
+                SearchEntry::Track(track("three")),
+                SearchEntry::Track(track("four")),
+            ]),
+        ));
+        assert!(
+            matches!(rx.try_recv(), Ok(Action::Add(items)) if items == vec![track("three"), track("four")])
+        );
     }
 
     #[test]

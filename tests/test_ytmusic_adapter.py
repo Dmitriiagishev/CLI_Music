@@ -11,6 +11,7 @@ ADAPTER = pathlib.Path(__file__).resolve().parents[1] / "assets" / "ytmusic.py"
 
 
 class FakeMusic:
+    watch_calls = []
     def __init__(self, **kwargs):
         if kwargs.get("language") != "en":
             raise AssertionError("Filtered ytmusicapi search requires English shelf names")
@@ -31,7 +32,18 @@ class FakeMusic:
         return {"tracks": [{"title": "Song" if i == 0 else f"Song {i}", "videoId": "abc" if i == 0 else f"id{i}", "artists": [{"name": "Artist"}]} for i in range(min(limit, 150))]}
 
     def get_watch_playlist(self, **kwargs):
-        return {"lyrics": "LYRICS_ID"}
+        self.watch_calls.append(kwargs)
+        tracks = [{"title": "Seed", "videoId": kwargs["videoId"]}, {"title": "Mix", "videoId": "mix", "artists": [{"name": "Other"}]}]
+        return {"lyrics": "LYRICS_ID", "related": "RELATED_ID", "tracks": tracks}
+
+    def get_song_related(self, value):
+        assert value == "RELATED_ID"
+        return [{"title": "Songs", "contents": [
+            {"title": "Seed", "videoId": "abc"},
+            {"title": "Related", "videoId": "rel", "artists": [{"name": "Other"}]},
+            {"title": "Repeated", "videoId": "rel"},
+            {"title": "Playlist", "playlistId": "PL1"},
+        ]}, {"title": "About", "contents": "A description"}]
 
     def get_lyrics(self, value):
         return {"lyrics": "First line\nSecond line"}
@@ -75,6 +87,15 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(len(tracks), 120)
         self.assertEqual(tracks[-1]["title"], "Artist — Song 119")
         self.assertEqual(self.call("lyrics", "abc"), "First line\nSecond line")
+
+    def test_details_and_radio_return_songs_without_seed_or_duplicates(self):
+        details = self.call("details", "abc")
+        self.assertEqual(details["lyrics"], "First line\nSecond line")
+        self.assertEqual([track["url"] for track in details["related"]], ["https://music.youtube.com/watch?v=rel"])
+        self.assertEqual(details["related"][0]["title"], "Other — Related")
+        radio = self.call("radio", "abc")
+        self.assertTrue(FakeMusic.watch_calls[-1]["radio"])
+        self.assertEqual([track["url"] for track in radio], ["https://music.youtube.com/watch?v=mix"])
 
 
 if __name__ == "__main__":

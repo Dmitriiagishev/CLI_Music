@@ -345,6 +345,13 @@ impl Player {
         if let Some(graph) = spectrum.as_ref().and_then(|s| s.graph()) {
             command.arg(format!("--af=lavfi=[{graph}]"));
         }
+        if mode != AudioMode::Default {
+            command.args([
+                "--cache=yes",
+                "--demuxer-max-bytes=64MiB",
+                "--demuxer-max-back-bytes=64MiB",
+            ]);
+        }
         let child = command
             .args([
                 "--no-video",
@@ -469,6 +476,50 @@ impl Player {
         (None, None)
     }
 
+    #[cfg(unix)]
+    fn seek_ready(&self, target: f64) -> Result<bool, String> {
+        let mut socket =
+            std::os::unix::net::UnixStream::connect(&self.endpoint).map_err(|e| e.to_string())?;
+        let _ = socket.set_read_timeout(Some(Duration::from_millis(100)));
+        socket.write_all(b"{\"command\":[\"get_property\",\"seekable\"],\"request_id\":1}\n{\"command\":[\"get_property\",\"demuxer-cache-state\"],\"request_id\":2}\n").map_err(|e| e.to_string())?;
+        let mut reader = BufReader::new(socket);
+        let mut cache = None;
+        for _ in 0..2 {
+            let mut line = String::new();
+            reader.read_line(&mut line).map_err(|e| e.to_string())?;
+            let value: serde_json::Value =
+                serde_json::from_str(&line).map_err(|e| e.to_string())?;
+            if value["request_id"] == 1 && value["data"] == true {
+                return Ok(true);
+            }
+            if value["request_id"] == 2 {
+                cache = Some(value["data"].clone());
+            }
+        }
+        let Some(cache) = cache else {
+            return Ok(false);
+        };
+        let ranges = cache["seekable-ranges"].as_array();
+        if ranges.is_some_and(|ranges| {
+            ranges.iter().any(|range| {
+                range["start"]
+                    .as_f64()
+                    .zip(range["end"].as_f64())
+                    .is_some_and(|(start, end)| target >= start && target <= end)
+            })
+        }) {
+            return Ok(true);
+        }
+        if cache["eof"] == true {
+            return Err("Этот участок недоступен для перемотки".into());
+        }
+        Ok(false)
+    }
+    #[cfg(windows)]
+    fn seek_ready(&self, _target: f64) -> Result<bool, String> {
+        Err("Перемотка на этой системе пока недоступна".into())
+    }
+
     fn command(&self, command: &str) -> Result<(), String> {
         // mpv creates the endpoint asynchronously after startup.
         for _ in 0..20 {
@@ -586,6 +637,8 @@ pub enum Action {
     Add(Vec<Track>),
     PlayList(Vec<Track>),
     PlayNext(Track),
+    ReplaceQueue(String, Vec<Track>),
+    Seek(f64),
     Remove(usize),
     Toggle,
     Next,
@@ -602,7 +655,8 @@ pub enum Event {
     QueueTail(u64, Vec<Track>, Result<Vec<SearchEntry>, String>),
     Cover(u64, Result<image::RgbImage, String>),
     Spectrum([f32; crate::spectrum::BANDS]),
-    Lyrics(u64, Result<String, String>),
+    Details(u64, Result<crate::music::Details, String>),
+    Radio(u64, u64, Result<Vec<Track>, String>),
 }
 
 pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) {
@@ -616,6 +670,7 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
     let mut preload: Option<Preload> = None;
     let mut last_spectrum = std::time::Instant::now();
     let mut last_progress = std::time::Instant::now();
+    let mut pending_seek: Option<f64> = None;
     let publish = |state: &mut State, queue: &VecDeque<Track>| {
         state.queue = queue.iter().cloned().collect();
         let _ = events.send(Event::State(state.clone()));
@@ -767,6 +822,24 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
         }
         if last_progress.elapsed() >= Duration::from_millis(500) {
             if let Some(active) = &player {
+                if let Some(target) = pending_seek {
+                    match active.seek_ready(target) {
+                        Ok(true) => {
+                            let command = serde_json::json!({"command": ["seek", target, "absolute", "exact"]}).to_string();
+                            if let Err(error) = active.command(&command) {
+                                let _ = events.send(Event::Message(error));
+                            } else {
+                                let _ = events.send(Event::Message(String::new()));
+                            }
+                            pending_seek = None;
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            let _ = events.send(Event::Message(error));
+                            pending_seek = None;
+                        }
+                    }
+                }
                 let (position, duration) = active.timing();
                 state.position = position;
                 state.duration = duration;
@@ -780,6 +853,7 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
                 state.current = Some(track.clone());
                 state.paused = false;
                 state.loading = true;
+                pending_seek = None;
                 state.position = None;
                 state.duration = None;
                 let prepared = preload
@@ -833,6 +907,25 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
         match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(Action::Add(tracks)) => queue.extend(tracks),
             Ok(Action::PlayNext(track)) => queue.push_front(track),
+            Ok(Action::ReplaceQueue(source, tracks)) => {
+                if state
+                    .current
+                    .as_ref()
+                    .is_some_and(|track| track.url == source)
+                {
+                    queue = tracks.into();
+                    preload = None;
+                } else {
+                    let _ = events.send(Event::Message("Трек сменился: радио не включено".into()));
+                }
+            }
+            Ok(Action::Seek(target)) => {
+                if player.is_some() && target.is_finite() {
+                    pending_seek = Some(target.max(0.0));
+                    let _ = events.send(Event::Message("Загружаем выбранный участок…".into()));
+                    last_progress = std::time::Instant::now() - Duration::from_millis(500);
+                }
+            }
             Ok(Action::PlayList(tracks)) => {
                 if tracks.is_empty() {
                     continue;
@@ -845,6 +938,7 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
                 state.can_previous = !history.is_empty();
                 player = None;
                 preload = None;
+                pending_seek = None;
                 state.loading = false;
                 state.current = None;
                 state.paused = false;
@@ -871,6 +965,7 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
                 }
                 state.can_previous = !history.is_empty();
                 player = None;
+                pending_seek = None;
                 state.loading = false;
                 state.current = None;
                 state.position = None;
@@ -884,6 +979,7 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
                     }
                     queue.push_front(previous);
                     player = None;
+                    pending_seek = None;
                     state.loading = false;
                     state.paused = false;
                     state.can_previous = !history.is_empty();
@@ -896,6 +992,7 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
                 state.can_previous = false;
                 player = None;
                 preload = None;
+                pending_seek = None;
                 state.loading = false;
                 state.current = None;
                 state.position = None;
