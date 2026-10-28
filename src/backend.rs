@@ -142,6 +142,7 @@ static NEXT_PLAYER: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AudioMode {
     Default,
+    TvPipe,
     Pipe,
     HlsPipe,
 }
@@ -202,7 +203,16 @@ impl Player {
             let mut extract = Command::new("yt-dlp");
             auth.apply(&mut extract);
             extract.args(["--no-playlist", "--no-progress"]);
-            if mode == AudioMode::HlsPipe {
+            if mode == AudioMode::TvPipe {
+                extract.args([
+                    "--extractor-args",
+                    "youtube:player_client=tv_samsung",
+                    "--http-chunk-size",
+                    "64K",
+                    "-f",
+                    "bestaudio/best",
+                ]);
+            } else if mode == AudioMode::HlsPipe {
                 extract.args([
                     "--extractor-args",
                     "youtube:player_client=web_safari",
@@ -213,9 +223,7 @@ impl Player {
                 // The authenticated Music client can use a PO-token provider.
                 // Restrict this to Music URLs so direct YouTube links keep
                 // yt-dlp's usual selection of clients.
-                if url.starts_with("https://music.youtube.com/")
-                    && (auth.browser.is_some() || auth.cookies.is_some())
-                {
+                if authenticated_music(url, auth) {
                     extract.args(["--extractor-args", "youtube:player_client=web_music"]);
                 }
                 extract.args(["-f", "bestaudio/best"]);
@@ -427,15 +435,22 @@ fn is_forbidden(logs: &str) -> bool {
         line.contains("403") && (line.contains("http") || line.contains("forbidden"))
     })
 }
-fn forbidden_retry(mode: AudioMode, logs: &str) -> Option<AudioMode> {
+fn authenticated_music(url: &str, auth: &Auth) -> bool {
+    url.starts_with("https://music.youtube.com/")
+        && (auth.browser.is_some() || auth.cookies.is_some())
+}
+fn forbidden_retry(mode: AudioMode, logs: &str, music_auth: bool) -> Option<AudioMode> {
     let unavailable = logs
         .to_ascii_lowercase()
         .contains("requested format is not available");
-    if !is_forbidden(logs) && !(mode == AudioMode::Pipe && unavailable) {
+    if mode != AudioMode::TvPipe && !is_forbidden(logs) && !(mode == AudioMode::Pipe && unavailable)
+    {
         return None;
     }
     match mode {
+        AudioMode::Default if music_auth => Some(AudioMode::TvPipe),
         AudioMode::Default => Some(AudioMode::Pipe),
+        AudioMode::TvPipe => Some(AudioMode::Pipe),
         AudioMode::Pipe => Some(AudioMode::HlsPipe),
         AudioMode::HlsPipe => None,
     }
@@ -524,56 +539,40 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
                                 )));
                             }
                         }
-                    } else if !success
-                        && forbidden_retry(active.mode, &logs) == Some(AudioMode::Pipe)
+                    } else if let Some(next) = (!success)
+                        .then(|| {
+                            forbidden_retry(
+                                active.mode,
+                                &logs,
+                                authenticated_music(&active.track_url, &active.auth),
+                            )
+                        })
+                        .flatten()
                     {
-                        let first_error = logs
-                            .lines()
-                            .find(|line| is_forbidden(line))
-                            .unwrap_or("HTTP 403 Forbidden")
-                            .to_owned();
-                        let _ = events.send(Event::Message(
-                            "Поток вернул 403; пробуем воспроизведение через yt-dlp…".into(),
-                        ));
+                        let previous = if let Some(previous) = &active.initial_error {
+                            format!("{previous}\nПовтор через yt-dlp:\n{logs}")
+                        } else {
+                            logs.lines()
+                                .find(|line| is_forbidden(line))
+                                .unwrap_or("HTTP 403 Forbidden")
+                                .to_owned()
+                        };
+                        let message = match next {
+                            AudioMode::TvPipe => "Поток вернул 403; пробуем клиент tv_samsung…",
+                            AudioMode::Pipe => "Повторяем воспроизведение через yt-dlp…",
+                            AudioMode::HlsPipe => {
+                                "Повтор не удался; пробуем аудио HLS через yt-dlp…"
+                            }
+                            AudioMode::Default => unreachable!(),
+                        };
+                        let _ = events.send(Event::Message(message.into()));
                         match Player::start(
                             &active.track_url,
                             &active.auth,
                             state.volume,
                             events.clone(),
                             active.spectrum.is_some(),
-                            AudioMode::Pipe,
-                            Some(first_error),
-                        ) {
-                            Ok(replacement) => {
-                                state.loading = true;
-                                publish(&mut state, &queue);
-                                player = Some(replacement);
-                                continue;
-                            }
-                            Err(e) => {
-                                let _ = events.send(Event::Message(format!(
-                                    "Не удалось повторить воспроизведение: {e}\n{logs}"
-                                )));
-                            }
-                        }
-                    } else if !success
-                        && forbidden_retry(active.mode, &logs) == Some(AudioMode::HlsPipe)
-                    {
-                        let previous = active
-                            .initial_error
-                            .as_deref()
-                            .unwrap_or("HTTP 403 Forbidden");
-                        let previous = format!("{previous}\nПовтор через yt-dlp:\n{logs}");
-                        let _ = events.send(Event::Message(
-                            "Повтор не удался; пробуем аудио HLS через yt-dlp…".into(),
-                        ));
-                        match Player::start(
-                            &active.track_url,
-                            &active.auth,
-                            state.volume,
-                            events.clone(),
-                            active.spectrum.is_some(),
-                            AudioMode::HlsPipe,
+                            next,
                             Some(previous),
                         ) {
                             Ok(replacement) => {
@@ -584,7 +583,7 @@ pub fn player_loop(rx: Receiver<Action>, events: Sender<Event>, mut auth: Auth) 
                             }
                             Err(e) => {
                                 let _ = events.send(Event::Message(format!(
-                                    "Не удалось запустить HLS: {e}\n{logs}"
+                                    "Не удалось повторить воспроизведение: {e}\n{logs}"
                                 )));
                             }
                         }
@@ -777,19 +776,60 @@ mod tests {
     #[test]
     fn stream_retries_are_bounded() {
         assert!(matches!(
-            forbidden_retry(AudioMode::Default, "HTTP error 403"),
+            forbidden_retry(AudioMode::Default, "HTTP error 403", true),
+            Some(AudioMode::TvPipe)
+        ));
+        assert!(matches!(
+            forbidden_retry(AudioMode::Default, "HTTP error 403", false),
             Some(AudioMode::Pipe)
         ));
         assert!(matches!(
-            forbidden_retry(AudioMode::Pipe, "HTTP Error 403: Forbidden"),
-            Some(AudioMode::HlsPipe)
+            forbidden_retry(AudioMode::TvPipe, "HTTP Error 403: Forbidden", true),
+            Some(AudioMode::Pipe)
         ));
-        assert!(forbidden_retry(AudioMode::HlsPipe, "HTTP 403").is_none());
         assert!(matches!(
-            forbidden_retry(AudioMode::Pipe, "ERROR: Requested format is not available"),
+            forbidden_retry(AudioMode::TvPipe, "Sign in required", true),
+            Some(AudioMode::Pipe)
+        ));
+        assert!(matches!(
+            forbidden_retry(AudioMode::Pipe, "HTTP Error 403: Forbidden", true),
             Some(AudioMode::HlsPipe)
         ));
-        assert!(forbidden_retry(AudioMode::Pipe, "Sign in to confirm you are not a bot").is_none());
+        assert!(forbidden_retry(AudioMode::HlsPipe, "HTTP 403", true).is_none());
+        assert!(matches!(
+            forbidden_retry(
+                AudioMode::Pipe,
+                "ERROR: Requested format is not available",
+                true
+            ),
+            Some(AudioMode::HlsPipe)
+        ));
+        assert!(forbidden_retry(
+            AudioMode::Pipe,
+            "Sign in to confirm you are not a bot",
+            true
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn music_retry_requires_music_url_and_cookies() {
+        let auth = Auth {
+            browser: Some("firefox".into()),
+            cookies: None,
+        };
+        assert!(authenticated_music(
+            "https://music.youtube.com/watch?v=abc",
+            &auth
+        ));
+        assert!(!authenticated_music(
+            "https://www.youtube.com/watch?v=abc",
+            &auth
+        ));
+        assert!(!authenticated_music(
+            "https://music.youtube.com/watch?v=abc",
+            &Auth::default()
+        ));
     }
 
     #[test]
